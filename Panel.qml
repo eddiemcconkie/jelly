@@ -1,0 +1,890 @@
+// PROTOTYPE — Jelly full-view popup wired to the live daemon (v0 ad-hoc
+// jelly-ipc). Single source of truth: the daemon's pushed PlaybackSnapshot.
+// The UI keeps no playback state — only a navigation cursor. Throwaway.
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+import "Mock.js" as Mock
+
+Panel {
+  id: root
+  moduleName: "eddie.jelly"
+  ipcTarget: "eddie.jelly"
+  manageIpc: false
+
+  property var anchorItem: null
+  property var hostWidget: null
+  readonly property var barIdentity: hostWidget || root
+
+  // ---- daemon snapshot: THE playback truth
+  property var snap: ({ status: "stopped", queue: [], current_index: null, volume: 100 })
+  property real position: 0
+  readonly property bool playing: snap.status === "playing"
+  readonly property bool connected: sock !== null && sock.connected
+  readonly property var now: {
+    var q = snap.queue || [], i = snap.current_index
+    if (i !== null && i !== undefined && q.length > 0 && i < q.length) return q[i]
+    return { id: "", name: connected ? "Nothing playing" : "Daemon offline", artist: "", album: "" }
+  }
+  readonly property real duration: {
+    var q = snap.queue, i = snap.current_index
+    if (i !== null && i !== undefined && q.length > 0 && i < q.length) {
+      var t = q[i]
+      if (t.duration_secs) return t.duration_secs
+    }
+    return snap.duration_secs || 0
+  }
+  readonly property string pillGlyph: playing ? "󰏤" : "󰐊"
+  readonly property string pillText: now.name + (now.album ? " — " + now.album : "")
+  readonly property string nowCover: coverByAlbum(now.album)
+
+  // ---- browse library (real dump from Jellyfin)
+  property var library: ({ albums: [], playlists: [] })
+  readonly property bool libraryLoaded: library.albums.length > 0
+
+  function plItemTitle(idx) {
+    var pls = library.playlists.filter(function(p2) { return p2.name === "Playlists" })
+    if (pls.length === 0) return ""
+    var it = (pls[0].items || [])[idx]
+    return it ? it.title : ""
+  }
+
+  // Queue index of the playing track within the CURRENT view, or -1 when
+  // the playing track isn't visible here.
+  function nowPlayingRaw() {
+    if (!now || !now.id) return -1
+    var t = tab, p = path
+    if (t === "queue") return snap.current_index !== null ? snap.current_index : -1
+    if (t === "albums") {
+      if (p.length >= 1) {
+        var al = library.albums[p[0]]
+        for (var i = 0; i < al.tracks.length; i++) if (al.tracks[i].id === now.id) return i
+      }
+      return -1
+    }
+    var pls = library.playlists.filter(function(p2) { return p2.name === "Playlists" })
+    if (pls.length === 0) return -1
+    var items = pls[0].items || []
+    if (p.length >= 1) {
+      var tracks = items[p[0]] ? (items[p[0]].tracks || []) : []
+      for (var j = 0; j < tracks.length; j++) if (tracks[j].id === now.id) return j
+      return -1
+    }
+    for (var k = 0; k < items.length; k++) if (items[k].type !== "Playlist" && items[k].id === now.id) return k
+    return -1
+  }
+
+  // Ride along with playback when in sync.
+  function followPlayback() {
+    var np = nowPlayingRaw()
+    if (np === lastKnownNp) return  // stale or unchanged push
+    lastKnownNp = np
+    if (np < 0) return
+    // Playback moved ONTO the cursor: that's a re-sync too.
+    if (items.length > 0 && cursorPos < items.length && items[cursorPos].raw === np) {
+      cursorFollows = true
+      return
+    }
+    if (!cursorFollows) return
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].raw === np) {
+        cursorPos = i
+        lastRaw = np
+        return
+      }
+    }
+  }
+
+  onSnapChanged: followPlayback()
+
+  function coverByAlbum(albumTitle) {
+    if (!albumTitle) return ""
+    var als = library.albums
+    for (var i = 0; i < als.length; i++) if (als[i].title === albumTitle) return als[i].cover || ""
+    return ""
+  }
+
+  // ---- navigation state (cursor is navigation-only, never playback truth)
+  property string tab: "albums"   // queue | albums | playlists
+  property var paths: ({ "queue": [], "albums": [], "playlists": [] })
+  property var filterTexts: ({ "queue": "", "albums": "", "playlists": "" })
+  property bool filtering: false
+  // cursorPos indexes the visible (possibly filtered) list; raw is the
+  // stable identity used for drill/play and for keeping focus across
+  // filter changes.
+  property int cursorPos: 0
+  property int lastRaw: -1
+  // The cursor rides along with the now-playing song until the user moves
+  // it away; moving it back onto the playing song re-syncs.
+  property bool cursorFollows: true
+  // Last index the daemon actually reported as playing; pushes that repeat
+  // it are stale echoes (e.g. the command-path push before mpv advances).
+  property int lastKnownNp: -1
+
+  readonly property var path: paths[tab]
+  readonly property string filterText: filtering ? filterInput.text : filterTexts[tab]
+
+  // ---- daemon socket. A Socket whose first connect failed can stay wedged
+  // (connected stays true, toggling coalesces), so the watchdog RECREATES
+  // the socket object instead of toggling it.
+  property real lastRecv: 0
+  property var sock: null
+
+  Component {
+    id: sockComp
+
+    Socket {
+      path: (Quickshell.env("XDG_RUNTIME_DIR") || "/run/user/1000") + "/jelly/daemon.sock"
+      connected: true
+      onError: console.warn("jelly: socket error", JSON.stringify(error))
+
+      parser: SplitParser {
+        onRead: line => {
+          if (line.trim() === "") return
+          root.lastRecv = Date.now()
+          try {
+            var msg = JSON.parse(line)
+            if (msg.type === "state") {
+              root.snap = msg
+              root.position = msg.position_secs || 0
+            } else if (msg.type === "position") {
+              root.position = msg.position_secs
+            } else if (msg.type === "error") {
+              console.warn("jelly daemon error:", msg.message)
+            }
+          } catch (e) { console.warn("jelly: bad line", e) }
+        }
+      }
+      onConnectedChanged: {
+        console.info("jelly: socket connected =", connected)
+        if (connected) Qt.callLater(function() { root.send({ type: "get_state" }) })
+      }
+    }
+  }
+
+  function connectSock() {
+    if (sock) sock.destroy()
+    sock = sockComp.createObject(root)
+  }
+
+  // Watchdog: the daemon may come up after us (the plugin service spawns it
+  // ~2s in), and a live daemon talks constantly (position events every
+  // 250ms while playing). Silence for 5s = rebuild the connection.
+  Timer {
+    interval: 3000
+    running: true
+    repeat: true
+    onTriggered: if (Date.now() - root.lastRecv > 5000) root.connectSock()
+  }
+
+  function send(obj) {
+    console.info("jelly: send", obj.type)
+    if (sock) {
+      sock.write(JSON.stringify(obj) + "\n")
+      sock.flush()
+    }
+  }
+
+  // ---- list model per view. Items: { raw, title, sub, kind, drillable,
+  //      playing, cover, playTrackIds, playStart }
+  // kind: "album" | "playlist" | "track"
+  function metasFrom(list, albumTitle) {
+    return list.map(function(x) {
+      return { id: x.id, name: x.title, artist: x.artist || "", album: albumTitle || x.album || "",
+               duration_secs: x.length ? x.length * 1.0 : null, image_url: null, stream_url: "" }
+    })
+  }
+
+  function rawList() {
+    var t = root.tab, p = root.path
+    if (t === "queue") {
+      return snap.queue.map(function(tr, i) {
+        return { raw: i, cover: coverByAlbum(tr.album), title: tr.name,
+                 sub: (tr.album ? tr.album + "  ·  " : "") + (tr.artist || "") + "  ·  " + Mock.fmt(tr.duration_secs || 0),
+                 kind: "track", drillable: false, playing: i === snap.current_index,
+                 playTrackIds: snap.queue.map(function(q) { return q.id }), playStart: i }
+      })
+    }
+    if (t === "albums") {
+      if (p.length === 0)
+        return library.albums.map(function(al, i) {
+          return { raw: i, cover: al.cover || "", title: al.title, sub: al.artist + "  ·  " + al.tracks.length + " tracks",
+                   kind: "album", drillable: true, playing: false,
+                   playTrackIds: al.tracks.map(function(x) { return x.id }), playStart: 0 }
+        })
+      var album = library.albums[p[0]]
+      return album.tracks.map(function(tr, i) {
+        return { raw: i, cover: album.cover || "", title: (i + 1) + ". " + tr.title, sub: tr.artist + "  ·  " + Mock.fmt(tr.length),
+                 kind: "track", drillable: false, playing: tr.id === now.id,
+                 playTrackIds: album.tracks.map(function(x) { return x.id }), playStart: i }
+      })
+    }
+    // playlists: items of the "Playlists" playlist — nested playlists are
+    // drillable like albums.
+    var pls = library.playlists.filter(function(p2) { return p2.name === "Playlists" })
+    if (pls.length === 0) return []
+    var items = pls[0].items || []
+    if (p.length === 0)
+      return items.map(function(it, i) {
+        var isPl = it.type === "Playlist"
+        return { raw: i, cover: it.cover || "", title: it.title,
+                 sub: isPl ? (it.tracks ? it.tracks.length + " tracks" : "playlist") : (it.artist || ""),
+                 kind: isPl ? "playlist" : "track", drillable: isPl, playing: !isPl && it.id === now.id,
+                 playTrackIds: isPl ? (it.tracks || []).map(function(x) { return x.id }) : items.filter(function(x) { return x.type !== "Playlist" }).map(function(x) { return x.id }),
+                 playStart: 0 }
+      })
+    var parent = items[p[0]]
+    var tracks = parent ? (parent.tracks || []) : []
+    return tracks.map(function(tr, i) {
+      return { raw: i, cover: coverByAlbum(parent.title), title: (i + 1) + ". " + tr.title,
+               sub: tr.artist || "", kind: "track", drillable: false, playing: tr.id === now.id,
+               playTrackIds: tracks.map(function(x) { return x.id }), playStart: i }
+    })
+  }
+
+  readonly property var rawItems: rawList()
+  readonly property var items: filterText === "" ? rawItems
+    : rawItems.filter(function(it) {
+        var q = filterText.toLowerCase()
+        return it.title.toLowerCase().indexOf(q) >= 0 || it.sub.toLowerCase().indexOf(q) >= 0
+      })
+
+  // Keep the same underlying item focused when the list changes under a
+  // filter (clearing or editing maps the cursor back via its raw index).
+  // Cursor bookkeeping in one place: park cursorPos on whatever is actually
+  // rendered (the playing row while following, else the lastRaw remap) and
+  // ask the list to scroll there. Used by drill/pop/tab/open/items-change so
+  // the real cursor can never disagree with the visible highlight.
+  signal requestScroll(int pos)
+
+  function placeCursor() {
+    if (items.length === 0) { cursorPos = 0; lastRaw = -1; return }
+    var np = nowPlayingRaw()
+    if (cursorFollows && np >= 0) {
+      for (var n = 0; n < items.length; n++) {
+        if (items[n].raw === np) { cursorPos = n; lastRaw = np; requestScroll(n); return }
+      }
+    }
+    var idx = -1
+    for (var i = 0; i < items.length; i++) if (items[i].raw === lastRaw) { idx = i; break }
+    cursorPos = idx >= 0 ? idx : Math.min(cursorPos, items.length - 1)
+    lastRaw = items[cursorPos].raw
+    requestScroll(cursorPos)
+  }
+
+  onItemsChanged: {
+    if (items.length === 0) { cursorPos = 0; lastRaw = -1; return }
+    var before = cursorPos
+    // While following, park the cursor on the playing row: this is what
+    // makes a fresh popup open on the right song (and keeps j/k moving
+    // from where the highlight actually is).
+    if (cursorFollows && nowPlayingRaw() >= 0) {
+      var npIdx = -1
+      for (var n = 0; n < items.length; n++) if (items[n].raw === nowPlayingRaw()) { npIdx = n; break }
+      if (npIdx >= 0) { cursorPos = npIdx; lastRaw = nowPlayingRaw() }
+    } else {
+      var idx = -1
+      for (var i = 0; i < items.length; i++) if (items[i].raw === lastRaw) { idx = i; break }
+      cursorPos = idx >= 0 ? idx : Math.min(cursorPos, items.length - 1)
+      lastRaw = items[cursorPos].raw
+    }
+    if (cursorPos !== before) requestScroll(cursorPos)
+  }
+
+  // The visible selection is derived, never stored: the playing row while
+  // in sync, the user cursor otherwise. No two sources can fight, and a
+  // pushed state moves the highlight with the data it arrived with.
+  readonly property int renderedCursor: {
+    var np = nowPlayingRaw()
+    if (cursorFollows && np >= 0) {
+      for (var i = 0; i < items.length; i++) if (items[i].raw === np) return i
+    }
+    return cursorPos
+  }
+
+  function moveCursor(d) {
+    if (items.length === 0) return
+    cursorPos = Math.max(0, Math.min(items.length - 1, cursorPos + d))
+    lastRaw = items[cursorPos].raw
+    cursorFollows = items[cursorPos].playing
+  }
+
+  function clampCursor() {
+    if (items.length === 0) { cursorPos = 0; return }
+    cursorPos = Math.min(cursorPos, items.length - 1)
+    lastRaw = items[cursorPos].raw
+  }
+
+  function drill() {
+    var it = items[cursorPos]
+    if (!it || !it.drillable) return
+    clearFilter()
+    var p = paths[tab].slice()
+    p.push(it.raw)
+    var np = {}
+    for (var k in paths) np[k] = paths[k]
+    np[tab] = p
+    paths = np
+    placeCursor()
+  }
+
+  function popLevel() {
+    clearFilter()
+    if (paths[tab].length === 0) return false
+    var np = {}
+    for (var k in paths) np[k] = paths[k]
+    np[tab] = paths[tab].slice(0, -1)
+    paths = np
+    placeCursor()
+    return true
+  }
+
+  function switchTab(t) {
+    clearFilter()
+    if (t === tab) {
+      var np = {}
+      for (var k in paths) np[k] = paths[k]
+      np[t] = []
+      paths = np
+      placeCursor()
+      return
+    }
+    tab = t
+    placeCursor()
+  }
+
+  function activate() {
+    console.info("jelly: activate tab=", tab, "cursorPos=", cursorPos, "items=", items.length)
+    cursorFollows = true
+    var it = items[cursorPos]
+    if (!it) return
+    if (it.drillable) { drill(); return }
+    // enter = play from here; daemon state push moves the UI
+    if (!it.playTrackIds || it.playTrackIds.length === 0) return
+    var metas = buildMetas(it)
+    if (metas.length === 0) return
+    send({ type: "play", tracks: metas, start_index: it.playStart })
+  }
+
+  // TrackMeta list for the item's context (daemon rebuilds stream URLs from ids).
+  function buildMetas(it) {
+    var t = tab, p = path
+    var src = []
+    if (t === "queue") {
+      src = snap.queue.map(function(q) {
+        return { id: q.id, name: q.name, artist: q.artist || "", album: q.album || "", duration_secs: q.duration_secs || null, stream_url: "" }
+      })
+    } else if (t === "albums") {
+      if (p.length >= 1) {
+        var al = library.albums[p[0]]
+        src = metasFrom(al.tracks, al.title)
+      } else {
+        // album row: play the album itself
+        var al2 = library.albums[it.raw]
+        if (al2) src = metasFrom(al2.tracks, al2.title)
+      }
+    } else if (t === "playlists") {
+      var pls = library.playlists.filter(function(p2) { return p2.name === "Playlists" })
+      if (pls.length > 0) {
+        var items = pls[0].items || []
+        if (p.length >= 1) {
+          var parent = items[p[0]]
+          src = metasFrom(parent ? (parent.tracks || []) : [], parent ? parent.title : "")
+        } else if (it.kind === "playlist") {
+          var nested = items[it.raw]
+          src = metasFrom(nested.tracks || [], nested.title)
+        } else {
+          // play the first nested playlist's tracks as a stand-in
+          for (var i = 0; i < items.length; i++)
+            if (items[i].type === "Playlist") { src = metasFrom(items[i].tracks || [], items[i].title); break }
+        }
+      }
+    }
+    return src
+  }
+
+  // ---- transport commands
+  // Jump the cursor to the playing track and re-sync. Only offered when the
+  // playing track is visible in the current view.
+  function focusPlaying() {
+    var np = nowPlayingRaw()
+    if (np < 0) return
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].raw === np) {
+        cursorPos = i
+        lastRaw = np
+        cursorFollows = true
+        return
+      }
+    }
+  }
+
+  readonly property bool canFocusPlaying: nowPlayingRaw() >= 0
+
+  function togglePlay() { send({ type: "toggle_play" }) }
+  function skip(dir) {
+    // Optimistic cursor when riding along: we know which track is next,
+    // so move the selection now; the daemon's state push confirms it.
+    if (cursorFollows) {
+      var np = nowPlayingRaw()
+      if (np >= 0) {
+        var target = np + dir
+        for (var i = 0; i < items.length; i++) {
+          if (items[i].raw === target) {
+            cursorPos = i
+            lastRaw = target
+            break
+          }
+        }
+      }
+    }
+    send(dir > 0 ? { type: "next" } : { type: "prev" })
+    if (snap.status === "paused") send({ type: "resume" })
+  }
+  function nextTrack() { skip(1) }
+  function prevTrack() { skip(-1) }
+  function seekBy(d) { send({ type: "seek", position_secs: Math.max(0, position + d) }) }
+
+  function startFilter() { filtering = true; Qt.callLater(function() { filterInput.forceActiveFocus() }) }
+
+  function commitFilter() {
+    var nf = {}
+    for (var k in filterTexts) nf[k] = filterTexts[k]
+    nf[tab] = filterInput.text
+    filterTexts = nf
+    filtering = false
+    Qt.callLater(function() { keyFocus.forceActiveFocus() })
+  }
+
+  function cancelFilter() {
+    filtering = false
+    Qt.callLater(function() { keyFocus.forceActiveFocus() })
+  }
+
+  function clearFilter() {
+    filtering = false
+    var nf = {}
+    for (var k in filterTexts) nf[k] = filterTexts[k]
+    nf[tab] = ""
+    filterTexts = nf
+  }
+
+  // ---- contextual hint bar
+  readonly property string hints: {
+    if (!connected) return "daemon offline — start jelly-daemon"
+    if (filtering) return "type to filter (live) · enter keep & jump in · esc cancel"
+    var h = "j/k move"
+    var it = (items.length > 0 && cursorPos < items.length) ? items[cursorPos] : null
+    if (it && it.drillable) h += " · enter open"
+    else if (it && it.kind === "track") h += " · enter play"
+    h += " · h out · / filter" + (root.canFocusPlaying ? " · o playing" : "") + " · space play/pause · n/N next/prev · ,/. seek · q close"
+    return h
+  }
+
+  function open() { controller.show() }
+  function close() { controller.hide() }
+  function toggle() { opened ? close() : open() }
+  function refresh() {}
+
+  function injectKeys() {
+    Qt.callLater(function() { if (!filtering) keyFocus.forceActiveFocus() })
+  }
+
+  // ---- library load
+  FileView {
+    path: Qt.resolvedUrl("MockLibrary.json")
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      try {
+        root.library = JSON.parse(text())
+        var first = root.library.albums.length > 0 ? root.library.albums[0] : null
+        console.info("jelly: library loaded,", root.library.albums.length, "albums, first cover:",
+                     first ? (first.cover || "<none>") : "<empty>")
+      } catch (e) { console.warn("jelly: bad library json", e) }
+    }
+  }
+
+  // Cover preloader: decode every cover once into Qt's image cache so
+  // scrolling list rows never show a blank slot on the way back.
+  // Preloader: decode every cover once into Qt's image cache. Kept visible
+  // but parked off-screen — async images with visible:false never load.
+  Item {
+    x: -9999
+    y: -9999
+    width: 1
+    height: 1
+    Repeater {
+      model: root.library.albums
+      Image {
+        required property var modelData
+        source: modelData.cover || ""
+        cache: true
+        asynchronous: true
+        sourceSize.width: 88
+        sourceSize.height: 88
+      }
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: root.anchorItem
+    owner: root.barIdentity
+    bar: root.bar
+    open: root.opened
+    centerOnBar: true
+    focusTarget: keyFocus
+    contentWidth: panel.fittedContentWidth(Style.space(680))
+    contentHeight: panel.fittedContentHeight(fullColumn.implicitHeight)
+
+    onOpenChanged: if (open) injectKeys()
+
+    FocusScope {
+      id: keyFocus
+      anchors.fill: parent
+      focus: true
+      Keys.priority: Keys.BeforeItem
+
+      Keys.onPressed: function(event) {
+        console.info("jelly: key", event.key, JSON.stringify(event.text))
+        var t = event.text
+        // No key repeat on transport keys: held n/N would queue a burst of
+        // cold network fetches in mpv. j/k and ,/. keep their repeat.
+        var transport = t === "n" || t === "N" || event.key === Qt.Key_Space
+        if (transport && event.isAutoRepeat) { event.accepted = true; return }
+        // A committed filter comes first: esc/h clear it before any
+        // view navigation happens.
+        if (!root.filtering && root.filterText !== ""
+            && (event.key === Qt.Key_Escape || t === "h")) {
+          root.clearFilter(); event.accepted = true; return
+        }
+        if (event.key === Qt.Key_Escape) {
+          if (root.filtering) { root.clearFilter(); event.accepted = true; return }
+          if (root.popLevel()) { event.accepted = true; return }
+          root.close(); event.accepted = true; return
+        }
+        if (event.key === Qt.Key_Down || t === "j") { root.moveCursor(1); event.accepted = true; return }
+        if (event.key === Qt.Key_Up || t === "k") { root.moveCursor(-1); event.accepted = true; return }
+        if (event.key === Qt.Key_Left || t === "h") { root.popLevel(); event.accepted = true; return }
+        if (event.key === Qt.Key_Right || t === "l") { root.drill(); event.accepted = true; return }
+        if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.activate(); event.accepted = true; return }
+        if (event.key === Qt.Key_Space) { root.togglePlay(); event.accepted = true; return }
+        if (t === "n") { root.nextTrack(); event.accepted = true; return }
+        if (t === "N") { root.prevTrack(); event.accepted = true; return }
+        if (t === ",") { root.seekBy(-10); event.accepted = true; return }
+        if (t === ".") { root.seekBy(10); event.accepted = true; return }
+        if (t === "q") { root.close(); event.accepted = true; return }
+        if (t === "/") { root.startFilter(); event.accepted = true; return }
+        if (t === "o") { root.focusPlaying(); event.accepted = true; return }
+        if (t === "Q") { root.switchTab("queue"); event.accepted = true; return }
+        if (t === "A") { root.switchTab("albums"); event.accepted = true; return }
+        if (t === "P") { root.switchTab("playlists"); event.accepted = true; return }
+      }
+    }
+
+    Column {
+      id: fullColumn
+      anchors.fill: parent
+      spacing: Style.space(8)
+
+      // tabs row
+      Row {
+        leftPadding: Style.space(16)
+        rightPadding: Style.space(16)
+        spacing: Style.space(10)
+
+        Repeater {
+          model: [ { key: "Q", id: "queue", label: "Queue" },
+                   { key: "A", id: "albums", label: "Albums" },
+                   { key: "P", id: "playlists", label: "Playlists" } ]
+
+          delegate: Rectangle {
+            required property var modelData
+            readonly property bool active: root.tab === modelData.id
+            width: tabLabel.implicitWidth + Style.space(14)
+            height: tabLabel.implicitHeight + Style.space(6)
+            radius: Style.cornerRadius
+            color: active ? Color.accent : "transparent"
+
+            Text {
+              id: tabLabel
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: "[" + parent.modelData.key + "] " + parent.modelData.label
+              color: parent.active ? Color.background : Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              font.bold: parent.active
+            }
+          }
+        }
+      }
+
+      // breadcrumbs
+      Text {
+        textFormat: Text.PlainText
+        leftPadding: Style.space(16)
+        text: root.tab === "queue" ? "Queue"
+            : root.tab === "albums" ? ("Albums" + (root.path.length >= 1 ? "  ›  " + root.library.albums[root.path[0]].title : ""))
+            : (root.path.length >= 1 ? "Playlists  ›  " + plItemTitle(root.path[0]) : "Playlists")
+        color: Qt.darker(Color.foreground, 1.4)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      // filter input
+      TextField {
+        id: filterInput
+        visible: root.filtering
+        x: Style.space(16)
+        width: Style.space(300)
+        placeholderText: "filter…"
+        foreground: Color.foreground
+        font.family: Style.font.family
+        onVisibleChanged: if (visible) { text = root.filterTexts[root.tab] || "" ; selectAll(); forceActiveFocus() }
+        Keys.onPressed: function(event) {
+          if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.commitFilter(); event.accepted = true }
+          else if (event.key === Qt.Key_Escape) { root.cancelFilter(); event.accepted = true }
+        }
+      }
+
+      // list
+      ListView {
+        id: list
+        width: parent.width
+        height: Style.space(380)
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        model: root.items
+        highlight: null
+
+        // The cursor is ours, not ListView's: model resets clobber
+        // currentIndex, so we scroll to the cursor manually instead. Model
+        // resets also clobber contentY (every playback push recomputes the
+        // list), so the scroll offset is saved/restored across them — only
+        // j/k should move the list.
+        property real savedY: 0
+        // The model reset clobbers contentY before onItemsChanged can
+        // restore it, so snapshot on a short lag instead.
+        Timer { interval: 200; running: list.visible; repeat: true; onTriggered: list.savedY = list.contentY }
+
+        // One-row buffer: keep the neighbours contained too, so the cursor
+        // never sits flush against an edge while navigating.
+        function scrollListTo(pos) {
+            if (pos < 0) return
+            var n = list.count
+            list.positionViewAtIndex(Math.min(pos + 1, n - 1), ListView.Contain)
+            list.positionViewAtIndex(Math.max(pos - 1, 0), ListView.Contain)
+            list.savedY = list.contentY
+        }
+        Connections {
+            target: root
+            function onRenderedCursorChanged() {
+                if (root.renderedCursor < 0) return
+                scrollListTo(root.renderedCursor)
+            }
+            function onRequestScroll(pos) { scrollListTo(pos) }
+            function onItemsChanged() { list.contentY = list.savedY }
+        }
+        onWidthChanged: if (root.cursorPos >= 0) positionViewAtIndex(root.cursorPos, ListView.Contain)
+
+        delegate: Item {
+          required property var modelData
+          required property int index
+          width: list.width
+          height: Math.max(rowImg.visible ? rowImg.height : 0, rowCol.implicitHeight) + Style.space(8)
+
+          Rectangle {
+            anchors.fill: parent
+            color: index === root.renderedCursor ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : "transparent"
+          }
+
+          Row {
+            id: rowCol
+            leftPadding: Style.space(16)
+            rightPadding: Style.space(16)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(10)
+
+            Image {
+              id: rowImg
+              visible: modelData.cover !== "" && (modelData.kind !== "track" || root.tab === "queue")
+              source: modelData.cover || ""
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(44)
+              height: Style.space(44)
+              asynchronous: true
+              cache: true
+              sourceSize.width: 88
+              sourceSize.height: 88
+              fillMode: Image.PreserveAspectCrop
+              onStatusChanged: if (status === Image.Error || status === Image.Null) console.warn("jelly: cover", status, source)
+            }
+
+            Column {
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: 0
+
+              Text {
+                textFormat: Text.PlainText
+                text: modelData.title
+                color: modelData.playing ? Color.accent : Color.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                font.bold: modelData.playing
+                elide: Text.ElideRight
+                width: Style.space(560)
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: modelData.sub
+                color: Qt.darker(Color.foreground, 1.5)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                width: Style.space(560)
+              }
+            }
+          }
+        }
+      }
+
+      Text {
+        visible: root.items.length === 0
+        leftPadding: Style.space(16)
+        text: {
+          if (!root.libraryLoaded && root.tab !== "queue") return "Loading library…"
+          return "No matches" + (root.filterText !== "" ? " for \u201C" + root.filterText + "\u201D — esc to clear" : " here")
+        }
+        color: Qt.darker(Color.foreground, 1.7)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      // ---- Now Playing, pinned at the bottom
+      Rectangle {
+        id: npBar
+        width: parent.width
+        height: npRow.implicitHeight + Style.space(12)
+        color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.06)
+
+        // Width available to the text/progress column: bar minus its own
+        // padding, minus the cover and the gap between them.
+        readonly property real contentW:
+          width - Style.space(16 + 16 + 12) - (nowCover.visible ? nowCover.width : 0)
+
+        Row {
+          id: npRow
+          x: Style.space(16)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(12)
+
+          Image {
+            id: nowCover
+            visible: root.nowCover !== ""
+            source: root.nowCover
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.space(52)
+            height: Style.space(52)
+            asynchronous: true
+            cache: true
+            sourceSize.width: 104
+            sourceSize.height: 104
+            fillMode: Image.PreserveAspectCrop
+          }
+
+            Column {
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(4)
+
+              Row {
+                spacing: Style.space(8)
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.playing ? "󰏤" : "󰐊"
+                  color: root.connected ? Color.foreground : Color.urgent
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.now.name
+                  color: Color.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                  elide: Text.ElideRight
+                  width: npBar.contentW - Style.space(24)
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: root.now.album || ""
+                color: Qt.darker(Color.foreground, 1.4)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                width: npBar.contentW
+              }
+
+            Rectangle {
+              width: npBar.contentW
+              height: Style.space(5)
+              radius: height / 2
+              color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.12)
+
+              Rectangle {
+                width: Math.round(parent.width * (root.duration > 0 ? root.position / root.duration : 0))
+                height: parent.height
+                radius: parent.radius
+                color: Color.accent
+              }
+            }
+
+            Item {
+              width: npBar.contentW
+              height: posTime.implicitHeight
+
+              Text {
+                id: posTime
+                textFormat: Text.PlainText
+                anchors.left: parent.left
+                text: Mock.fmt(root.position)
+                color: Qt.darker(Color.foreground, 1.5)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                anchors.right: parent.right
+                text: root.connected ? Mock.fmt(root.duration) : "offline"
+                color: Qt.darker(Color.foreground, 1.5)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+        }
+      }
+
+      // hint bar
+      Text {
+        textFormat: Text.PlainText
+        leftPadding: Style.space(16)
+        rightPadding: Style.space(16)
+        width: parent.width
+        text: root.hints
+        color: Qt.darker(Color.foreground, 1.6)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+    }
+  }
+}
