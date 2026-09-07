@@ -137,6 +137,7 @@ Panel {
   property int lastRaw: -1
 
   readonly property var path: paths[tab]
+  onPathChanged: console.info("jelly: path ->", JSON.stringify(path), "tab", tab)
   readonly property string filterText: filtering ? filterInput.text : filterTexts[tab]
 
   // ---- daemon socket. A Socket whose first connect failed can stay wedged
@@ -210,6 +211,29 @@ Panel {
     })
   }
 
+  // Metadata for the drilled-in album/playlist detail view (header block).
+  function detailMeta() {
+    var t = tab, p = path
+    if (t === "albums" && p.length >= 1) {
+      var al = library.albums[p[0]]
+      if (!al) return {}
+      var dur = 0
+      for (var i = 0; i < al.tracks.length; i++) dur += al.tracks[i].length || 0
+      return { title: al.title, artist: al.artist, cover: coverFor(al), count: al.tracks.length, dur: dur }
+    }
+    if (t === "playlists" && p.length >= 1) {
+      var pls = library.playlists.filter(function(p2) { return p2.name === "Playlists" })
+      if (pls.length === 0) return {}
+      var parent = (pls[0].items || [])[p[0]]
+      if (!parent) return {}
+      var tracks = parent.tracks || []
+      var d2 = 0
+      for (var j = 0; j < tracks.length; j++) d2 += tracks[j].length || 0
+      return { title: parent.title, artist: parent.artist || "", cover: coverFor(parent), count: tracks.length, dur: d2 }
+    }
+    return {}
+  }
+
   function rawList() {
     var t = root.tab, p = root.path
     if (t === "queue") {
@@ -229,7 +253,7 @@ Panel {
         })
       var album = library.albums[p[0]]
       return album.tracks.map(function(tr, i) {
-        return { raw: i, cover: album.cover || "", title: (i + 1) + ". " + tr.title, sub: tr.artist + "  ·  " + Mock.fmt(tr.length),
+        return { raw: i, cover: album.cover || "", title: tr.title, sub: tr.artist + "  ·  " + Mock.fmt(tr.length),
                  kind: "track", drillable: false, playing: tr.id === now.id,
                  playTrackIds: album.tracks.map(function(x) { return x.id }), playStart: i }
       })
@@ -251,7 +275,7 @@ Panel {
     var parent = items[p[0]]
     var tracks = parent ? (parent.tracks || []) : []
     return tracks.map(function(tr, i) {
-      return { raw: i, cover: coverFor(parent), title: (i + 1) + ". " + tr.title,
+      return { raw: i, cover: coverFor(parent), title: tr.title,
                sub: tr.artist || "", kind: "track", drillable: false, playing: tr.id === now.id,
                playTrackIds: tracks.map(function(x) { return x.id }), playStart: i }
     })
@@ -291,6 +315,13 @@ Panel {
   function moveCursor(d) {
     if (items.length === 0) return
     cursorPos = Math.max(0, Math.min(items.length - 1, cursorPos + d))
+    lastRaw = items[cursorPos].raw
+    requestScroll(cursorPos)
+  }
+
+  function jumpCursor(pos) {
+    if (items.length === 0) return
+    cursorPos = Math.max(0, Math.min(items.length - 1, pos))
     lastRaw = items[cursorPos].raw
     requestScroll(cursorPos)
   }
@@ -552,6 +583,8 @@ Panel {
         if (event.key === Qt.Key_Right || t === "l") { root.drill(); event.accepted = true; return }
         if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.activate(); event.accepted = true; return }
         if (event.key === Qt.Key_Space) { root.togglePlay(); event.accepted = true; return }
+        if (t === "g") { root.jumpCursor(0); event.accepted = true; return }
+        if (t === "G") { root.jumpCursor(root.items.length - 1); event.accepted = true; return }
         if (t === "n") { root.nextTrack(); event.accepted = true; return }
         if (t === "N") { root.prevTrack(); event.accepted = true; return }
         if (t === ",") { root.seekBy(-10); event.accepted = true; return }
@@ -667,6 +700,76 @@ Panel {
         model: root.items
         highlight: null
 
+        // Detail-view metadata (cover, title, artist, counts). Lives in the
+        // list header so it scrolls away as you move down.
+        header: root.tab !== "queue" && root.path.length >= 1 ? headerComp : null
+
+        Component {
+          id: headerComp
+
+          Item {
+            readonly property var meta: root.detailMeta()
+            width: list.width
+            height: Style.space(128)
+            Component.onCompleted: console.info("jelly: header created, meta:", JSON.stringify(meta))
+
+            Row {
+              x: Style.space(16)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(14)
+
+              Image {
+                id: headerCover
+                source: parent.parent.meta.cover || ""
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(104)
+                height: Style.space(104)
+                asynchronous: true
+                cache: true
+                sourceSize.width: 320
+                sourceSize.height: 320
+                fillMode: Image.PreserveAspectCrop
+              }
+
+              Column {
+                anchors.bottom: headerCover.bottom
+                anchors.bottomMargin: Style.space(2)
+                spacing: Style.space(4)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: parent.parent.parent.meta.title || ""
+                  color: Color.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.heading
+                  font.bold: true
+                  elide: Text.ElideRight
+                  width: Style.space(500)
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: parent.parent.parent.meta.artist || ""
+                  color: Qt.darker(Color.foreground, 1.4)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                  width: Style.space(500)
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: (parent.parent.parent.meta.count || 0) + " tracks"
+                        + (parent.parent.parent.meta.dur ? "  ·  " + Mock.fmt(parent.parent.parent.meta.dur) : "")
+                  color: Qt.darker(Color.foreground, 1.6)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+          }
+        }
+
         // The cursor is ours, not ListView's: model resets clobber
         // currentIndex, so we scroll to the cursor manually instead. Model
         // resets also clobber contentY (every playback push recomputes the
@@ -675,12 +778,25 @@ Panel {
         property real savedY: 0
         // The model reset clobbers contentY before onItemsChanged can
         // restore it, so snapshot on a short lag instead.
-        Timer { interval: 200; running: list.visible; repeat: true; onTriggered: list.savedY = list.contentY }
+        Timer { interval: 200; running: list.visible; repeat: true; onTriggered: {
+            list.savedY = list.contentY
+            var hi = list.headerItem
+            console.info("jelly: contentY", list.contentY, "header", hi ? hi.height : "none",
+                         "headerY", hi ? hi.y : -1, "headerMap", hi ? JSON.stringify(hi.mapToItem(list, 0, 0)) : "{}",
+                         "listY", list.y, "listH", list.height, "visible", list.visible,
+                         "cursor", root.cursorPos, "count", list.count)
+        } }
 
         // One-row buffer: keep the neighbours contained too, so the cursor
         // never sits flush against an edge while navigating.
         function scrollListTo(pos) {
             if (pos < 0 || list.count === 0) return
+            // Near the top: pin to the very start so the detail header
+            // stays in view (the one-row-buffer below would scroll past it
+            // and never come back, since Contain only scrolls when the
+            // target is out of view).
+            var top = list.headerItem ? -list.headerItem.height : 0
+            if (pos === 0) { list.contentY = top; list.savedY = top; return }
             var n = list.count
             list.positionViewAtIndex(Math.min(pos + 1, n - 1), ListView.Contain)
             list.positionViewAtIndex(Math.max(pos - 1, 0), ListView.Contain)
