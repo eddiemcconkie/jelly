@@ -1,5 +1,13 @@
 # Operating rules for this repo (jelly-daemon + eddie.jelly plugin)
 
+## Project management
+- All project management lives in **Plane** (via the Plane MCP): the Wayfinder
+  map issue, tickets, decisions, specs, and research notes. Do NOT keep
+  research docs, plans, or tracking files in this repo — put them on Plane
+  (as issue descriptions/comments or pages). The repo is for code only;
+  `CONTEXT.md` / `research/` are legacy from before this rule and should be
+  migrated to Plane when touched.
+
 ## Shell / plugin changes
 - After ANY change to plugin QML/JS files: run `omarchy plugin validate .` (in
   this dir), then `omarchy restart shell`. Hot reload exists but is unreliable.

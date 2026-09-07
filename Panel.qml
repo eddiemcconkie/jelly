@@ -102,8 +102,56 @@ Panel {
   function coverByAlbum(albumTitle) {
     if (!albumTitle) return ""
     var als = library.albums
-    for (var i = 0; i < als.length; i++) if (als[i].title === albumTitle) return als[i].cover || ""
+    for (var i = 0; i < als.length; i++) if (als[i].title === albumTitle) return coverFor(als[i])
     return ""
+  }
+
+  // ---- cover disk cache. QML only caches images in memory, so every
+  // popup open re-downloaded ~27 covers. The warmer downloads each cover
+  // once into $XDG_CACHE_HOME/jelly/covers/<id>.png; from then on rows
+  // use a file:// URL and opening the popup is instant.
+  readonly property string coverDir:
+    (Quickshell.env("XDG_CACHE_HOME") || (Quickshell.env("HOME") || "/home") + "/.cache") + "/jelly/covers"
+  // id -> "file://..." for every cover the warmer has confirmed on disk.
+  property var cachedCovers: ({})
+  property int coversRev: 0
+
+  function coverFor(item) {
+    var _ = coversRev  // re-evaluate when the warmer reports new files
+    return cachedCovers[item.id] || item.cover || ""
+  }
+
+  function warmCovers() {
+    var script = "mkdir -p '" + coverDir + "'\n"
+    function add(it) {
+      if (!it || !it.id || !it.cover) return
+      // Serve from disk once the file exists; download it if it doesn't.
+      script += "f='" + coverDir + "/" + it.id + ".png'"
+        + "; if [ -s \"$f\" ] || curl -sf '" + it.cover + "' -o \"$f\"; then echo '" + it.id + "'; fi\n"
+    }
+    for (var i = 0; i < library.albums.length; i++) add(library.albums[i])
+    for (var p = 0; p < library.playlists.length; p++) {
+      var its = library.playlists[p].items || []
+      for (var j = 0; j < its.length; j++) add(its[j])
+    }
+    coverWarmer.command = ["sh", "-c", script]
+    coverWarmer.running = true
+  }
+
+  Process {
+    id: coverWarmer
+    command: []
+    stdout: SplitParser {
+      onRead: line => {
+        var id = line.trim()
+        if (id === "") return
+        var m = {}
+        for (var k in root.cachedCovers) m[k] = root.cachedCovers[k]
+        m[id] = "file://" + root.coverDir + "/" + id + ".png"
+        root.cachedCovers = m
+      }
+    }
+    onExited: root.coversRev++
   }
 
   // ---- navigation state (cursor is navigation-only, never playback truth)
@@ -210,7 +258,7 @@ Panel {
     if (t === "albums") {
       if (p.length === 0)
         return library.albums.map(function(al, i) {
-          return { raw: i, cover: al.cover || "", title: al.title, sub: al.artist + "  ·  " + al.tracks.length + " tracks",
+          return { raw: i, cover: coverFor(al), title: al.title, sub: al.artist + "  ·  " + al.tracks.length + " tracks",
                    kind: "album", drillable: true, playing: false,
                    playTrackIds: al.tracks.map(function(x) { return x.id }), playStart: 0 }
         })
@@ -229,7 +277,7 @@ Panel {
     if (p.length === 0)
       return items.map(function(it, i) {
         var isPl = it.type === "Playlist"
-        return { raw: i, cover: it.cover || "", title: it.title,
+        return { raw: i, cover: coverFor(it), title: it.title,
                  sub: isPl ? (it.tracks ? it.tracks.length + " tracks" : "playlist") : (it.artist || ""),
                  kind: isPl ? "playlist" : "track", drillable: isPl, playing: !isPl && it.id === now.id,
                  playTrackIds: isPl ? (it.tracks || []).map(function(x) { return x.id }) : items.filter(function(x) { return x.type !== "Playlist" }).map(function(x) { return x.id }),
@@ -238,7 +286,7 @@ Panel {
     var parent = items[p[0]]
     var tracks = parent ? (parent.tracks || []) : []
     return tracks.map(function(tr, i) {
-      return { raw: i, cover: coverByAlbum(parent.title), title: (i + 1) + ". " + tr.title,
+      return { raw: i, cover: coverFor(parent), title: (i + 1) + ". " + tr.title,
                sub: tr.artist || "", kind: "track", drillable: false, playing: tr.id === now.id,
                playTrackIds: tracks.map(function(x) { return x.id }), playStart: i }
     })
@@ -309,6 +357,7 @@ Panel {
     cursorPos = Math.max(0, Math.min(items.length - 1, cursorPos + d))
     lastRaw = items[cursorPos].raw
     cursorFollows = items[cursorPos].playing
+    requestScroll(cursorPos)
   }
 
   function clampCursor() {
@@ -416,6 +465,7 @@ Panel {
         cursorPos = i
         lastRaw = np
         cursorFollows = true
+        requestScroll(i)
         return
       }
     }
@@ -435,6 +485,7 @@ Panel {
           if (items[i].raw === target) {
             cursorPos = i
             lastRaw = target
+            requestScroll(cursorPos)
             break
           }
         }
@@ -503,6 +554,7 @@ Panel {
         var first = root.library.albums.length > 0 ? root.library.albums[0] : null
         console.info("jelly: library loaded,", root.library.albums.length, "albums, first cover:",
                      first ? (first.cover || "<none>") : "<empty>")
+        root.warmCovers()
       } catch (e) { console.warn("jelly: bad library json", e) }
     }
   }
@@ -523,8 +575,8 @@ Panel {
         source: modelData.cover || ""
         cache: true
         asynchronous: true
-        sourceSize.width: 88
-        sourceSize.height: 88
+        sourceSize.width: 320
+        sourceSize.height: 320
       }
     }
   }
@@ -684,9 +736,9 @@ Panel {
             target: root
             function onRenderedCursorChanged() {
                 if (root.renderedCursor < 0) return
-                scrollListTo(root.renderedCursor)
+                list.scrollListTo(root.renderedCursor)
             }
-            function onRequestScroll(pos) { scrollListTo(pos) }
+            function onRequestScroll(pos) { list.scrollListTo(pos) }
             function onItemsChanged() { list.contentY = list.savedY }
         }
         onWidthChanged: if (root.cursorPos >= 0) positionViewAtIndex(root.cursorPos, ListView.Contain)
@@ -792,8 +844,8 @@ Panel {
             height: Style.space(52)
             asynchronous: true
             cache: true
-            sourceSize.width: 104
-            sourceSize.height: 104
+            sourceSize.width: 320
+            sourceSize.height: 320
             fillMode: Image.PreserveAspectCrop
           }
 
