@@ -1,6 +1,7 @@
 // PROTOTYPE — Jelly full-view popup wired to the live daemon (v0 ad-hoc
 // jelly-ipc). Single source of truth: the daemon's pushed PlaybackSnapshot.
-// The UI keeps no playback state — only a navigation cursor. Throwaway.
+// The UI keeps no playback state — only a navigation cursor, which starts
+// at the top of every view; o jumps to the playing track. Throwaway.
 import QtQuick
 import Quickshell
 import Quickshell.Io
@@ -44,13 +45,6 @@ Panel {
   property var library: ({ albums: [], playlists: [] })
   readonly property bool libraryLoaded: library.albums.length > 0
 
-  function plItemTitle(idx) {
-    var pls = library.playlists.filter(function(p2) { return p2.name === "Playlists" })
-    if (pls.length === 0) return ""
-    var it = (pls[0].items || [])[idx]
-    return it ? it.title : ""
-  }
-
   // Queue index of the playing track within the CURRENT view, or -1 when
   // the playing track isn't visible here.
   function nowPlayingRaw() {
@@ -75,29 +69,6 @@ Panel {
     for (var k = 0; k < items.length; k++) if (items[k].type !== "Playlist" && items[k].id === now.id) return k
     return -1
   }
-
-  // Ride along with playback when in sync.
-  function followPlayback() {
-    var np = nowPlayingRaw()
-    if (np === lastKnownNp) return  // stale or unchanged push
-    lastKnownNp = np
-    if (np < 0) return
-    // Playback moved ONTO the cursor: that's a re-sync too.
-    if (items.length > 0 && cursorPos < items.length && items[cursorPos].raw === np) {
-      cursorFollows = true
-      return
-    }
-    if (!cursorFollows) return
-    for (var i = 0; i < items.length; i++) {
-      if (items[i].raw === np) {
-        cursorPos = i
-        lastRaw = np
-        return
-      }
-    }
-  }
-
-  onSnapChanged: followPlayback()
 
   function coverByAlbum(albumTitle) {
     if (!albumTitle) return ""
@@ -164,12 +135,6 @@ Panel {
   // filter changes.
   property int cursorPos: 0
   property int lastRaw: -1
-  // The cursor rides along with the now-playing song until the user moves
-  // it away; moving it back onto the playing song re-syncs.
-  property bool cursorFollows: true
-  // Last index the daemon actually reported as playing; pushes that repeat
-  // it are stale echoes (e.g. the command-path push before mpv advances).
-  property int lastKnownNp: -1
 
   readonly property var path: paths[tab]
   readonly property string filterText: filtering ? filterInput.text : filterTexts[tab]
@@ -295,8 +260,7 @@ Panel {
   readonly property var rawItems: rawList()
   readonly property var items: filterText === "" ? rawItems
     : rawItems.filter(function(it) {
-        var q = filterText.toLowerCase()
-        return it.title.toLowerCase().indexOf(q) >= 0 || it.sub.toLowerCase().indexOf(q) >= 0
+        return it.title.toLowerCase().indexOf(filterText.toLowerCase()) >= 0
       })
 
   // Keep the same underlying item focused when the list changes under a
@@ -307,56 +271,27 @@ Panel {
   // the real cursor can never disagree with the visible highlight.
   signal requestScroll(int pos)
 
-  function placeCursor() {
-    if (items.length === 0) { cursorPos = 0; lastRaw = -1; return }
-    var np = nowPlayingRaw()
-    if (cursorFollows && np >= 0) {
-      for (var n = 0; n < items.length; n++) {
-        if (items[n].raw === np) { cursorPos = n; lastRaw = np; requestScroll(n); return }
-      }
-    }
-    var idx = -1
-    for (var i = 0; i < items.length; i++) if (items[i].raw === lastRaw) { idx = i; break }
-    cursorPos = idx >= 0 ? idx : Math.min(cursorPos, items.length - 1)
-    lastRaw = items[cursorPos].raw
-    requestScroll(cursorPos)
+  // Entering a view always starts at the top; o jumps to the playing row.
+  function resetViewCursor() {
+    cursorPos = 0
+    lastRaw = -1
+    requestScroll(0)
   }
 
   onItemsChanged: {
     if (items.length === 0) { cursorPos = 0; lastRaw = -1; return }
     var before = cursorPos
-    // While following, park the cursor on the playing row: this is what
-    // makes a fresh popup open on the right song (and keeps j/k moving
-    // from where the highlight actually is).
-    if (cursorFollows && nowPlayingRaw() >= 0) {
-      var npIdx = -1
-      for (var n = 0; n < items.length; n++) if (items[n].raw === nowPlayingRaw()) { npIdx = n; break }
-      if (npIdx >= 0) { cursorPos = npIdx; lastRaw = nowPlayingRaw() }
-    } else {
-      var idx = -1
-      for (var i = 0; i < items.length; i++) if (items[i].raw === lastRaw) { idx = i; break }
-      cursorPos = idx >= 0 ? idx : Math.min(cursorPos, items.length - 1)
-      lastRaw = items[cursorPos].raw
-    }
+    var idx = -1
+    for (var i = 0; i < items.length; i++) if (items[i].raw === lastRaw) { idx = i; break }
+    cursorPos = idx >= 0 ? idx : Math.min(cursorPos, items.length - 1)
+    lastRaw = items[cursorPos].raw
     if (cursorPos !== before) requestScroll(cursorPos)
-  }
-
-  // The visible selection is derived, never stored: the playing row while
-  // in sync, the user cursor otherwise. No two sources can fight, and a
-  // pushed state moves the highlight with the data it arrived with.
-  readonly property int renderedCursor: {
-    var np = nowPlayingRaw()
-    if (cursorFollows && np >= 0) {
-      for (var i = 0; i < items.length; i++) if (items[i].raw === np) return i
-    }
-    return cursorPos
   }
 
   function moveCursor(d) {
     if (items.length === 0) return
     cursorPos = Math.max(0, Math.min(items.length - 1, cursorPos + d))
     lastRaw = items[cursorPos].raw
-    cursorFollows = items[cursorPos].playing
     requestScroll(cursorPos)
   }
 
@@ -376,7 +311,7 @@ Panel {
     for (var k in paths) np[k] = paths[k]
     np[tab] = p
     paths = np
-    placeCursor()
+    resetViewCursor()
   }
 
   function popLevel() {
@@ -386,8 +321,15 @@ Panel {
     for (var k in paths) np[k] = paths[k]
     np[tab] = paths[tab].slice(0, -1)
     paths = np
-    placeCursor()
+    resetViewCursor()
     return true
+  }
+
+  // Cycle tabs in display order; [ goes left, ] goes right, wrapping.
+  function cycleTab(dir) {
+    var order = ["queue", "albums", "playlists"]
+    var next = (order.indexOf(tab) + dir + order.length) % order.length
+    switchTab(order[next])
   }
 
   function switchTab(t) {
@@ -397,16 +339,15 @@ Panel {
       for (var k in paths) np[k] = paths[k]
       np[t] = []
       paths = np
-      placeCursor()
+      resetViewCursor()
       return
     }
     tab = t
-    placeCursor()
+    resetViewCursor()
   }
 
   function activate() {
     console.info("jelly: activate tab=", tab, "cursorPos=", cursorPos, "items=", items.length)
-    cursorFollows = true
     var it = items[cursorPos]
     if (!it) return
     if (it.drillable) { drill(); return }
@@ -464,7 +405,6 @@ Panel {
       if (items[i].raw === np) {
         cursorPos = i
         lastRaw = np
-        cursorFollows = true
         requestScroll(i)
         return
       }
@@ -475,22 +415,6 @@ Panel {
 
   function togglePlay() { send({ type: "toggle_play" }) }
   function skip(dir) {
-    // Optimistic cursor when riding along: we know which track is next,
-    // so move the selection now; the daemon's state push confirms it.
-    if (cursorFollows) {
-      var np = nowPlayingRaw()
-      if (np >= 0) {
-        var target = np + dir
-        for (var i = 0; i < items.length; i++) {
-          if (items[i].raw === target) {
-            cursorPos = i
-            lastRaw = target
-            requestScroll(cursorPos)
-            break
-          }
-        }
-      }
-    }
     send(dir > 0 ? { type: "next" } : { type: "prev" })
     if (snap.status === "paused") send({ type: "resume" })
   }
@@ -530,7 +454,7 @@ Panel {
     var it = (items.length > 0 && cursorPos < items.length) ? items[cursorPos] : null
     if (it && it.drillable) h += " · enter open"
     else if (it && it.kind === "track") h += " · enter play"
-    h += " · h out · / filter" + (root.canFocusPlaying ? " · o playing" : "") + " · space play/pause · n/N next/prev · ,/. seek · q close"
+    h += " · h out · / filter · [/] tabs" + (root.canFocusPlaying ? " · o playing" : "") + " · space play/pause · n/N next/prev · ,/. seek · q close"
     return h
   }
 
@@ -590,7 +514,11 @@ Panel {
     centerOnBar: true
     focusTarget: keyFocus
     contentWidth: panel.fittedContentWidth(Style.space(680))
-    contentHeight: panel.fittedContentHeight(fullColumn.implicitHeight)
+    // Floor at the stable layout sum: at first open the Column hasn't been
+    // laid out yet and its implicitHeight reads ~53, which would birth the
+    // window tiny and grow it a few frames later.
+    contentHeight: panel.fittedContentHeight(
+      Math.max(fullColumn.implicitHeight, Style.space(521)))
 
     onOpenChanged: if (open) injectKeys()
 
@@ -634,6 +562,8 @@ Panel {
         if (t === "Q") { root.switchTab("queue"); event.accepted = true; return }
         if (t === "A") { root.switchTab("albums"); event.accepted = true; return }
         if (t === "P") { root.switchTab("playlists"); event.accepted = true; return }
+        if (event.key === Qt.Key_BracketLeft) { root.cycleTab(-1); event.accepted = true; return }
+        if (event.key === Qt.Key_BracketRight) { root.cycleTab(1); event.accepted = true; return }
       }
     }
 
@@ -642,8 +572,12 @@ Panel {
       anchors.fill: parent
       spacing: Style.space(8)
 
-      // tabs row
+      // tabs row; the filter input temporarily takes its place while
+      // filtering so the list never jumps.
       Row {
+        id: tabsRow
+        visible: !root.filtering
+        height: Style.space(30)
         leftPadding: Style.space(16)
         rightPadding: Style.space(16)
         spacing: Style.space(10)
@@ -656,6 +590,7 @@ Panel {
           delegate: Rectangle {
             required property var modelData
             readonly property bool active: root.tab === modelData.id
+            anchors.verticalCenter: parent.verticalCenter
             width: tabLabel.implicitWidth + Style.space(14)
             height: tabLabel.implicitHeight + Style.space(6)
             radius: Style.cornerRadius
@@ -665,7 +600,7 @@ Panel {
               id: tabLabel
               anchors.centerIn: parent
               textFormat: Text.PlainText
-              text: "[" + parent.modelData.key + "] " + parent.modelData.label
+              text: parent.modelData.label
               color: parent.active ? Color.background : Color.foreground
               font.family: Style.font.family
               font.pixelSize: Style.font.body
@@ -673,29 +608,44 @@ Panel {
             }
           }
         }
+
+        // committed filter, shown inline so the filtered state is obvious
+        Rectangle {
+          visible: !root.filtering && root.filterTexts[root.tab] !== ""
+          anchors.verticalCenter: parent.verticalCenter
+          width: filterBadge.implicitWidth + Style.space(12)
+          height: Style.space(22)
+          radius: Style.cornerRadius
+          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18)
+
+          Text {
+            id: filterBadge
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            // Truncate in JS: a fixed Text width would overflow this
+            // naturally-sized pill.
+            text: {
+              var f = root.filterTexts[root.tab]
+              return "/" + (f.length > 18 ? f.slice(0, 17) + "…" : f)
+            }
+            color: Color.accent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+        }
       }
 
-      // breadcrumbs
-      Text {
-        textFormat: Text.PlainText
-        leftPadding: Style.space(16)
-        text: root.tab === "queue" ? "Queue"
-            : root.tab === "albums" ? ("Albums" + (root.path.length >= 1 ? "  ›  " + root.library.albums[root.path[0]].title : ""))
-            : (root.path.length >= 1 ? "Playlists  ›  " + plItemTitle(root.path[0]) : "Playlists")
-        color: Qt.darker(Color.foreground, 1.4)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
-      }
-
-      // filter input
+      // filter input — occupies the tabs row's slot while filtering
       TextField {
         id: filterInput
         visible: root.filtering
         x: Style.space(16)
+        height: tabsRow.height
         width: Style.space(300)
         placeholderText: "filter…"
         foreground: Color.foreground
         font.family: Style.font.family
+        verticalAlignment: TextInput.AlignVCenter
         onVisibleChanged: if (visible) { text = root.filterTexts[root.tab] || "" ; selectAll(); forceActiveFocus() }
         Keys.onPressed: function(event) {
           if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.commitFilter(); event.accepted = true }
@@ -703,11 +653,15 @@ Panel {
         }
       }
 
-      // list
-      ListView {
-        id: list
+      // list; the empty-state message overlays it so the popup height
+      // never depends on whether there are results.
+      Item {
         width: parent.width
         height: Style.space(380)
+
+      ListView {
+        id: list
+        anchors.fill: parent
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         model: root.items
@@ -726,7 +680,7 @@ Panel {
         // One-row buffer: keep the neighbours contained too, so the cursor
         // never sits flush against an edge while navigating.
         function scrollListTo(pos) {
-            if (pos < 0) return
+            if (pos < 0 || list.count === 0) return
             var n = list.count
             list.positionViewAtIndex(Math.min(pos + 1, n - 1), ListView.Contain)
             list.positionViewAtIndex(Math.max(pos - 1, 0), ListView.Contain)
@@ -734,10 +688,7 @@ Panel {
         }
         Connections {
             target: root
-            function onRenderedCursorChanged() {
-                if (root.renderedCursor < 0) return
-                list.scrollListTo(root.renderedCursor)
-            }
+            function onCursorPosChanged() { list.scrollListTo(root.cursorPos) }
             function onRequestScroll(pos) { list.scrollListTo(pos) }
             function onItemsChanged() { list.contentY = list.savedY }
         }
@@ -751,7 +702,7 @@ Panel {
 
           Rectangle {
             anchors.fill: parent
-            color: index === root.renderedCursor ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : "transparent"
+            color: !root.filtering && index === root.cursorPos ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : "transparent"
           }
 
           Row {
@@ -807,6 +758,7 @@ Panel {
 
       Text {
         visible: root.items.length === 0
+        anchors.centerIn: parent
         leftPadding: Style.space(16)
         text: {
           if (!root.libraryLoaded && root.tab !== "queue") return "Loading library…"
@@ -815,6 +767,7 @@ Panel {
         color: Qt.darker(Color.foreground, 1.7)
         font.family: Style.font.family
         font.pixelSize: Style.font.bodySmall
+      }
       }
 
       // ---- Now Playing, pinned at the bottom
