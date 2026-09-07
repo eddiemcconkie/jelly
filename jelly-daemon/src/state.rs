@@ -8,6 +8,10 @@ use tokio::sync::watch;
 
 pub type SharedState = Arc<watch::Sender<Arc<PlaybackSnapshot>>>;
 
+/// Monotonic revision of the local library snapshot. 0 until the snapshot
+/// layer exists; browse fetches are always fresh so nothing invalidates.
+pub const LIBRARY_REV: u64 = 0;
+
 pub fn initial() -> (SharedState, watch::Receiver<Arc<PlaybackSnapshot>>) {
     let (tx, rx) = watch::channel(Arc::new(PlaybackSnapshot {
         auth: Some(AuthStatus::NeedsUnlock),

@@ -6,7 +6,7 @@
 //! tokio-land over an unbounded channel.
 
 use libmpv2::Mpv;
-use jelly_ipc::PlaybackStatus;
+use jelly_ipc::{PlaybackStatus, RepeatMode};
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc;
 
@@ -14,6 +14,15 @@ use tokio::sync::mpsc;
 pub enum EngineCommand {
     /// Replace the queue with these URLs and play from `start_index`.
     PlayUrls { urls: Vec<String>, start_index: usize },
+    /// Append URLs to the end of the playlist (starts playing if idle).
+    Enqueue(Vec<String>),
+    /// Insert a URL right after the currently playing entry.
+    InsertNext(String),
+    /// Jump to this queue index.
+    JumpTo(usize),
+    /// Remove this queue index (never the playing entry — the coordinator
+    /// refuses that before we see it).
+    RemoveAt(usize),
     Pause,
     Unpause,
     Toggle,
@@ -22,6 +31,8 @@ pub enum EngineCommand {
     SetVolume(u8),
     Next,
     Prev,
+    /// Repeat affects what happens at queue end / track end.
+    SetRepeat(RepeatMode),
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +92,7 @@ fn run_engine(
 
     let mut status = PlaybackStatus::Stopped;
     let mut queue_len: usize = 0;
+    let mut repeat = RepeatMode::Off;
     // mpv's internal playlist starts at 0 even when we load from
     // start_index; this offset maps internal positions back to queue
     // indices (single source of truth for "which track is playing").
@@ -89,14 +101,30 @@ fn run_engine(
     loop {
         // 1. Drain pending commands.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if let Err(e) = handle_command(&mpv, cmd, &mut status, &mut queue_len, &mut offset, &event_tx) {
+            if let Err(e) = handle_command(
+                &mpv,
+                cmd,
+                &mut status,
+                &mut queue_len,
+                &mut offset,
+                &mut repeat,
+                &event_tx,
+            ) {
                 tracing::warn!("engine command failed: {e}");
             }
         }
 
         // 2. Wait for the next mpv event (bounded so commands are seen).
         match mpv.wait_event(POLL_SECS) {
-            Some(Ok(event)) => handle_event(&mpv, event, &mut status, &mut offset, queue_len, &event_tx),
+            Some(Ok(event)) => handle_event(
+                &mpv,
+                event,
+                &mut status,
+                &mut offset,
+                queue_len,
+                &repeat,
+                &event_tx,
+            ),
             // Note: EndFile(ERROR) arrives here as an Err, not as an event.
             Some(Err(e)) => {
                 tracing::warn!("mpv event error: {e}");
@@ -127,6 +155,7 @@ fn handle_command(
     status: &mut PlaybackStatus,
     queue_len: &mut usize,
     offset: &mut usize,
+    repeat: &mut RepeatMode,
     event_tx: &mpsc::UnboundedSender<EngineEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
@@ -146,6 +175,61 @@ fn handle_command(
             mpv.set_property("pause", false)?;
             let _ = event_tx.send(EngineEvent::TrackChanged(start_index));
             set_status(status, event_tx, PlaybackStatus::Playing);
+        }
+        EngineCommand::Enqueue(urls) => {
+            for url in &urls {
+                // append-play starts playback if the playlist is idle;
+                // that is the desired behavior when the queue was stopped.
+                mpv.command("loadfile", &[url, "append-play"])?;
+            }
+            *queue_len += urls.len();
+        }
+        EngineCommand::InsertNext(url) => {
+            // insert-next places the entry after the current one without
+            // interrupting playback. While stopped there is no "current";
+            // fall back to a plain append.
+            if *status == PlaybackStatus::Stopped {
+                mpv.command("loadfile", &[url.as_str(), "append-play"])?;
+            } else {
+                mpv.command("loadfile", &[url.as_str(), "insert-next"])?;
+            }
+            *queue_len += 1;
+        }
+        EngineCommand::JumpTo(index) => {
+            if index >= *queue_len || index < *offset {
+                return Err(format!("jump target {index} outside queue").into());
+            }
+            let idx = (index - *offset).to_string();
+            mpv.command("playlist-play", &[idx.as_str()])?;
+        }
+        EngineCommand::RemoveAt(index) => {
+            if index >= *queue_len || index < *offset {
+                return Err(format!("remove target {index} outside queue").into());
+            }
+            let internal = index - *offset;
+            let pos = internal.to_string();
+            mpv.command("playlist-remove", &[pos.as_str()])?;
+            *queue_len -= 1;
+            // Removing an entry before the playing one shifts mpv's
+            // internal positions down by one.
+            let playing: i64 = mpv.get_property("playlist-playing-pos").unwrap_or(0).max(0);
+            if (internal as i64) < playing {
+                *offset = offset.saturating_sub(1);
+            }
+        }
+        EngineCommand::SetRepeat(mode) => {
+            // Native mpv looping: repeat-one loops the current file,
+            // repeat-all loops the whole (internal) playlist. Our EndFile
+            // handler skips the idle-stop while either is active.
+            mpv.set_property(
+                "loop-file",
+                if mode == RepeatMode::One { "inf" } else { "no" },
+            )?;
+            mpv.set_property(
+                "loop-playlist",
+                if mode == RepeatMode::All { "inf" } else { "no" },
+            )?;
+            *repeat = mode;
         }
         EngineCommand::Pause => {
             mpv.set_property("pause", true)?;
@@ -194,6 +278,7 @@ fn handle_event(
     status: &mut PlaybackStatus,
     offset: &mut usize,
     queue_len: usize,
+    repeat: &RepeatMode,
     event_tx: &mpsc::UnboundedSender<EngineEvent>,
 ) {
     use libmpv2::events::Event;
@@ -214,7 +299,12 @@ fn handle_event(
             }
         }
         Event::EndFile(reason) => {
-            // EOF with nothing left in our view of the queue: stop.
+            // EOF with nothing left in our view of the queue: stop —
+            // unless a repeat mode owns the transition (mpv loops natively
+            // via loop-file / loop-playlist).
+            if *repeat != RepeatMode::Off {
+                return;
+            }
             let pos: i64 = mpv.get_property("playlist-playing-pos").unwrap_or(0).max(0);
             if reason == 0 && // MPV_END_FILE_REASON_EOF (not re-exported by libmpv2)
                 (*offset).saturating_add(pos as usize).saturating_add(1) >= queue_len

@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
             "id": a.id,
             "title": a.name,
             "artist": a.album_artist.clone().unwrap_or_default(),
-            "cover": format!("{base}/Items/{}/Images/Primary", a.id),
+            "cover": format!("{base}/Items/{}/Images/Primary?fillWidth=320&quality=90", a.id),
             "tracks": ts.iter().map(|t| serde_json::json!({
                 "id": t.id,
                 "title": t.name,
@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
                 "title": ch.name,
                 "artist": ch.album_artist.clone().unwrap_or_default(),
                 "length": ch.run_time_ticks.map(|x| (x as f64 / 1e7).round() as i64).unwrap_or(0),
-                "cover": format!("{}/Items/{}/Images/Primary", "https://jellyfin.mcconkie.dev", ch.id),
+                "cover": format!("{}/Items/{}/Images/Primary?fillWidth=320&quality=90", "https://jellyfin.mcconkie.dev", ch.id),
             });
             if is_playlist {
                 let ts = c.tracks_for_album(&ch.id).await?;

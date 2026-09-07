@@ -4,7 +4,6 @@ use anyhow::Result;
 use jelly_daemon::coordinator::{AppCommand, Coordinator};
 use jelly_daemon::{jellyfin, mpris, playback, server, state};
 use jelly_ipc::DaemonMessage;
-use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, watch};
 
 #[tokio::main]
@@ -16,14 +15,14 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let server_url =
-        std::env::var("QUICKJELL_SERVER").unwrap_or_else(|_| "https://jellyfin.mcconkie.dev".into());
+    let server_url = std::env::var("JELLY_SERVER").unwrap_or_else(|_| "https://jellyfin.mcconkie.dev".into());
     tracing::info!("jelly daemon starting; server: {server_url}");
 
     let (state_tx, state_rx) = state::initial();
     let (auth_tx, auth_rx) = watch::channel(jelly_ipc::AuthStatus::NeedsUnlock);
     let (broadcast_tx, _) = broadcast::channel::<DaemonMessage>(64);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AppCommand>();
+    let (browse_tx, mut browse_rx) = mpsc::unbounded_channel::<server::BrowseRequest>();
     let (engine_event_tx, mut engine_event_rx) = mpsc::unbounded_channel();
 
     let engine = playback::spawn(engine_event_tx, 100);
@@ -47,12 +46,13 @@ async fn main() -> Result<()> {
     // Try a silent login (never prompts; needs rbw unlocked).
     coordinator.try_autologin().await;
 
-    let srv = server::bind(cmd_tx, broadcast_tx.clone(), state_rx, auth_rx).await?;
+    let srv = server::bind(cmd_tx, browse_tx, broadcast_tx.clone(), state_rx, auth_rx).await?;
     tokio::spawn(srv.run());
 
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => coordinator.handle_cmd(cmd).await,
+            Some(req) = browse_rx.recv() => coordinator.handle_browse(req).await,
             Some(ev) = engine_event_rx.recv() => coordinator.handle_engine_event(ev).await,
             else => break,
         }

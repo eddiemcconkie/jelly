@@ -3,6 +3,7 @@
 //! Reference: research/jellyfin-api.md
 
 use anyhow::{Context, Result};
+use jelly_ipc::BrowseItem;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -181,7 +182,7 @@ impl JellyfinClient {
             .as_ref()?
             .primary
             .is_some()
-            .then(|| format!("{}/Items/{}/Images/Primary", self.base_url, item.id))
+            .then(|| format!("{}/Items/{}/Images/Primary?fillWidth=320&quality=90", self.base_url, item.id))
     }
 
     /// Album artists — the top of the browse tree.
@@ -244,11 +245,43 @@ impl JellyfinClient {
                 &[
                     ("userId", user_id),
                     ("includeItemTypes", "Playlist"),
+                    ("recursive", "true"),
                     ("sortBy", "SortName"),
                 ],
             )
             .await?;
         Ok(resp.items)
+    }
+
+    /// Items of one playlist. NOTE: playlists are NOT browsable with the
+    /// parentId trick used for albums — they need their own endpoint.
+    pub async fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<MediaItem>> {
+        let user_id = self.user_id.as_deref().context("not authenticated")?;
+        let path = format!("/Playlists/{playlist_id}/Items");
+        let resp: ItemsResponse = self
+            .get_json(&path, &[("userId", user_id), ("fields", "ImageTags,MediaSources,Artists")])
+            .await?;
+        Ok(resp.items)
+    }
+}
+
+/// Jellyfin item → wire browse item.
+pub fn browse_item_from(item: &MediaItem, image_url: Option<String>) -> BrowseItem {
+    BrowseItem {
+        id: item.id.clone(),
+        name: item.name.clone(),
+        item_type: item.item_type.clone().unwrap_or_default(),
+        detail: item
+            .album_artist
+            .clone()
+            .or_else(|| {
+                item.artists
+                    .as_ref()
+                    .and_then(|a| a.first().cloned())
+            })
+            .unwrap_or_default(),
+        duration_secs: item.run_time_ticks.map(|t| t as f64 / 10_000_000.0),
+        image_url,
     }
 }
 
