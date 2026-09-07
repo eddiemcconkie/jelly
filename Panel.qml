@@ -378,7 +378,6 @@ Panel {
   }
 
   function activate() {
-    console.info("jelly: activate tab=", tab, "cursorPos=", cursorPos, "items=", items.length)
     var it = items[cursorPos]
     if (!it) return
     if (it.drillable) { drill(); return }
@@ -506,9 +505,6 @@ Panel {
     onLoaded: {
       try {
         root.library = JSON.parse(text())
-        var first = root.library.albums.length > 0 ? root.library.albums[0] : null
-        console.info("jelly: library loaded,", root.library.albums.length, "albums, first cover:",
-                     first ? (first.cover || "<none>") : "<empty>")
         root.warmCovers()
       } catch (e) { console.warn("jelly: bad library json", e) }
     }
@@ -560,7 +556,6 @@ Panel {
       Keys.priority: Keys.BeforeItem
 
       Keys.onPressed: function(event) {
-        console.info("jelly: key", event.key, JSON.stringify(event.text))
         var t = event.text
         // No key repeat on transport keys: held n/N would queue a burst of
         // cold network fetches in mpv. j/k and ,/. keep their repeat.
@@ -585,6 +580,11 @@ Panel {
         if (event.key === Qt.Key_Space) { root.togglePlay(); event.accepted = true; return }
         if (t === "g") { root.jumpCursor(0); event.accepted = true; return }
         if (t === "G") { root.jumpCursor(root.items.length - 1); event.accepted = true; return }
+        if (t === "s") { send({ type: "set_shuffle", on: !(snap.shuffle) }); event.accepted = true; return }
+        if (t === "r") {
+          var mode = snap.repeat === "all" ? "one" : snap.repeat === "one" ? "off" : "all"
+          send({ type: "set_repeat", mode: mode }); event.accepted = true; return
+        }
         if (t === "n") { root.nextTrack(); event.accepted = true; return }
         if (t === "N") { root.prevTrack(); event.accepted = true; return }
         if (t === ",") { root.seekBy(-10); event.accepted = true; return }
@@ -711,7 +711,6 @@ Panel {
             readonly property var meta: root.detailMeta()
             width: list.width
             height: Style.space(128)
-            Component.onCompleted: console.info("jelly: header created, meta:", JSON.stringify(meta))
 
             Row {
               x: Style.space(16)
@@ -780,11 +779,6 @@ Panel {
         // restore it, so snapshot on a short lag instead.
         Timer { interval: 200; running: list.visible; repeat: true; onTriggered: {
             list.savedY = list.contentY
-            var hi = list.headerItem
-            console.info("jelly: contentY", list.contentY, "header", hi ? hi.height : "none",
-                         "headerY", hi ? hi.y : -1, "headerMap", hi ? JSON.stringify(hi.mapToItem(list, 0, 0)) : "{}",
-                         "listY", list.y, "listH", list.height, "visible", list.visible,
-                         "cursor", root.cursorPos, "count", list.count)
         } }
 
         // One-row buffer: keep the neighbours contained too, so the cursor
@@ -921,40 +915,74 @@ Panel {
             Column {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(4)
+              width: npBar.contentW
 
-              Row {
-                spacing: Style.space(8)
-                Text {
-                  textFormat: Text.PlainText
-                  text: root.playing ? "󰏤" : "󰐊"
-                  color: root.connected ? Color.foreground : Color.urgent
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.body
-                }
-                Text {
-                  textFormat: Text.PlainText
-                  text: root.now.name
-                  color: Color.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                  elide: Text.ElideRight
-                  width: npBar.contentW - Style.space(24)
-                }
-              }
+              Item {
+                width: parent.width
+                height: npHeadCol.implicitHeight
 
-              Text {
-                textFormat: Text.PlainText
-                text: root.now.album || ""
-                color: Qt.darker(Color.foreground, 1.4)
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-                width: npBar.contentW
+                Column {
+                  id: npHeadCol
+                  spacing: Style.space(4)
+                  width: parent.width - (npControls.visible ? npControls.width + Style.space(12) : 0)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.now.name
+                    color: Color.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    elide: Text.ElideRight
+                    width: parent.width
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.now.album || ""
+                    color: Qt.darker(Color.foreground, 1.4)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                    width: parent.width
+                  }
+                }
+
+                Row {
+                  id: npControls
+                  visible: root.connected
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(10)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.playing ? "󰏤" : "󰐊"
+                    color: Color.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.heading
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "󰒝"
+                    color: root.snap.shuffle ? Color.accent : Qt.darker(Color.foreground, 1.6)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.heading
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.snap.repeat === "one" ? "󰑘" : "󰑖"
+                    color: root.snap.repeat === "off" ? Qt.darker(Color.foreground, 1.6) : Color.accent
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.heading
+                  }
+                }
               }
 
             Rectangle {
-              width: npBar.contentW
+              width: parent.width
               height: Style.space(5)
               radius: height / 2
               color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.12)
@@ -968,7 +996,7 @@ Panel {
             }
 
             Item {
-              width: npBar.contentW
+              width: parent.width
               height: posTime.implicitHeight
 
               Text {
