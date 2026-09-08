@@ -35,6 +35,8 @@ pub enum AppCommand {
     RemoveFromQueue { index: usize, req_id: Option<u64> },
     /// Move the waiting queue item at `index` by `delta` slots (clamped).
     MoveQueue { index: usize, delta: i32, req_id: Option<u64> },
+    /// Toggle the favorite flag on an item; pushes the refreshed set.
+    ToggleFavorite { item_id: String, req_id: Option<u64> },
     /// Re-authenticate using rbw-stored credentials.
     Login,
 }
@@ -55,6 +57,8 @@ pub struct Coordinator {
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCommand>,
     /// The two-tier playback model — the source of truth.
     pub model: crate::model::PlaybackModel,
+    /// Ids of the user's favorited songs (heart icons).
+    pub favorite_ids: Vec<String>,
     /// Last observed engine facts (mirrored into snapshots).
     pub position_secs: f64,
     pub duration_secs: Option<f64>,
@@ -86,6 +90,7 @@ impl Coordinator {
             repeat: self.model.repeat,
             library_rev: crate::state::LIBRARY_REV,
             auth: Some(*self.auth_rx.borrow()),
+            favorite_ids: self.favorite_ids.clone(),
         }
     }
 
@@ -232,6 +237,44 @@ impl Coordinator {
                     ));
                 }
             }
+            AppCommand::ToggleFavorite { item_id, req_id } => {
+                if !self.client.is_authenticated() {
+                    let _ = self.broadcast_tx.send(DaemonMessage::new(
+                        DaemonKind::Error {
+                            code: ErrorCode::NotAuthenticated,
+                            message: "favorites need an authenticated session".into(),
+                        },
+                        req_id,
+                    ));
+                } else {
+                    match self.client.toggle_favorite(&item_id).await {
+                        Ok(_) => {
+                            match self.client.favorite_ids().await {
+                                Ok(ids) => self.favorite_ids = ids,
+                                Err(e) => {
+                                    tracing::warn!("favorite refresh failed: {e:#}");
+                                    // Toggle succeeded; approximate by
+                                    // flipping this one id locally.
+                                    if let Some(p) = self.favorite_ids.iter().position(|i| i == &item_id) {
+                                        self.favorite_ids.remove(p);
+                                    } else {
+                                        self.favorite_ids.push(item_id.clone());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = self.broadcast_tx.send(DaemonMessage::new(
+                                DaemonKind::Error {
+                                    code: ErrorCode::Internal,
+                                    message: format!("favorite toggle failed: {e:#}"),
+                                },
+                                req_id,
+                            ));
+                        }
+                    }
+                }
+            }
         }
         self.push_state(&old).await;
     }
@@ -321,6 +364,11 @@ impl Coordinator {
                 Ok(_) => {
                     tracing::info!("authenticated as {username}");
                     let _ = self.auth_tx.send(AuthStatus::Authenticated);
+                    // Refresh the favorite set for the heart icons.
+                    match self.client.favorite_ids().await {
+                        Ok(ids) => self.favorite_ids = ids,
+                        Err(e) => tracing::warn!("favorite fetch failed: {e:#}"),
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("login failed: {e:#}");

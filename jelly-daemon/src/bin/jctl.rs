@@ -139,6 +139,12 @@ fn build_message(args: &[String]) -> (ClientKind, Option<u64>) {
             },
             req_id,
         ),
+        Some("fav") => (
+            K::ToggleFavorite {
+                item_id: args.get(1).cloned().unwrap_or_default(),
+            },
+            req_id,
+        ),
         Some("repeat") => (
             K::SetRepeat {
                 mode: match args.get(1).map(String::as_str) {

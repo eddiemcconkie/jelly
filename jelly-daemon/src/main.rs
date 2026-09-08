@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
         server_url: server_url.clone(),
         cmd_tx: cmd_tx.clone(),
         model: jelly_daemon::model::PlaybackModel::new(),
+        favorite_ids: Vec::new(),
         position_secs: 0.0,
         duration_secs: None,
         volume: 100,

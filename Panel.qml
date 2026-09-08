@@ -248,7 +248,7 @@ Panel {
           cover: coverByAlbum(tr.album) || (tr.image_url || ""),
           title: tr.name,
           sub: (tr.artist ? tr.artist : "") + (tr.duration_secs ? "  ·  " + Mock.fmt(tr.duration_secs) : ""),
-          kind: "track", drillable: false,
+          kind: "track", drillable: false, favId: tr.id,
           playing: tr.id === root.now.id && !root.snap.queue_head
         }
         for (var k in extra) base[k] = extra[k]
@@ -279,13 +279,14 @@ Panel {
     if (t === "albums") {
       if (p.length === 0)
         return library.albums.map(function(al, i) {
-          return { raw: i, cover: coverFor(al), title: al.title, sub: al.artist + "  ·  " + al.tracks.length + " tracks",
-                   kind: "album", drillable: true, playing: false,
+          return { raw: i, itemId: al.id, cover: coverFor(al), title: al.title, sub: al.artist + "  ·  " + al.tracks.length + " tracks",
+                   kind: "album", drillable: true,
+                   playing: nowCtx && nowCtx.name === al.title,
                    playTrackIds: al.tracks.map(function(x) { return x.id }), playStart: 0 }
         })
       var album = library.albums[p[0]]
       return album.tracks.map(function(tr, i) {
-        return { raw: i, cover: album.cover || "", title: tr.title, sub: tr.artist + "  ·  " + Mock.fmt(tr.length),
+        return { raw: i, favId: tr.id, cover: album.cover || "", title: tr.title, sub: tr.artist + "  ·  " + Mock.fmt(tr.length),
                  kind: "track", drillable: false, playing: tr.id === now.id,
                  playTrackIds: album.tracks.map(function(x) { return x.id }), playStart: i }
       })
@@ -298,16 +299,17 @@ Panel {
     if (p.length === 0)
       return items.map(function(it, i) {
         var isPl = it.type === "Playlist"
-        return { raw: i, cover: coverFor(it), title: it.title,
+        return { raw: i, itemId: it.id, cover: coverFor(it), title: it.title,
                  sub: isPl ? (it.tracks ? it.tracks.length + " tracks" : "playlist") : (it.artist || ""),
-                 kind: isPl ? "playlist" : "track", drillable: isPl, playing: !isPl && it.id === now.id,
+                 kind: isPl ? "playlist" : "track", drillable: isPl,
+                 playing: isPl ? (nowCtx && nowCtx.name === it.title) : (!isPl && it.id === now.id),
                  playTrackIds: isPl ? (it.tracks || []).map(function(x) { return x.id }) : items.filter(function(x) { return x.type !== "Playlist" }).map(function(x) { return x.id }),
                  playStart: 0 }
       })
     var parent = items[p[0]]
     var tracks = parent ? (parent.tracks || []) : []
     return tracks.map(function(tr, i) {
-      return { raw: i, cover: coverFor(parent), title: tr.title,
+      return { raw: i, favId: tr.id, cover: coverFor(parent), title: tr.title,
                sub: tr.artist || "", kind: "track", drillable: false, playing: tr.id === now.id,
                playTrackIds: tracks.map(function(x) { return x.id }), playStart: i }
     })
@@ -350,6 +352,18 @@ Panel {
     cursorPos = 0
     lastRaw = -1
     requestScroll(0)
+  }
+
+  // Park the cursor on the row with this raw identity (used when popping
+  // back out of a view, to land on the album/playlist we came from).
+  function focusRaw(raw, fallbackPos) {
+    var idx = -1
+    for (var i = 0; i < items.length; i++) if (items[i].raw === raw) { idx = i; break }
+    if (idx < 0) idx = nearestSelectable(fallbackPos || 0)
+    if (idx < 0) idx = 0
+    cursorPos = idx
+    lastRaw = items[idx] ? items[idx].raw : -1
+    requestScroll(idx)
   }
 
   onItemsChanged: {
@@ -402,6 +416,7 @@ Panel {
   function drill() {
     var it = items[cursorPos]
     if (!it || !it.drillable) return
+    // l navigates into the view one level.
     clearFilter()
     var p = paths[tab].slice()
     p.push(it.raw)
@@ -415,11 +430,13 @@ Panel {
   function popLevel() {
     clearFilter()
     if (paths[tab].length === 0) return false
+    var cameFrom = paths[tab][paths[tab].length - 1]
     var np = {}
     for (var k in paths) np[k] = paths[k]
     np[tab] = paths[tab].slice(0, -1)
     paths = np
-    resetViewCursor()
+    // Land on the album/playlist we just came from, not the top.
+    focusRaw(cameFrom, 0)
     return true
   }
 
@@ -455,8 +472,16 @@ Panel {
   function activate() {
     var it = items[cursorPos]
     if (!it) return
-    if (it.drillable) { drill(); return }
-    if (it.kind !== "track") return
+    // Enter plays: an album/playlist becomes the playback context from
+    // its start; a track plays in place.
+    if (it.kind !== "track") {
+      if (it.drillable && it.playTrackIds && it.playTrackIds.length > 0) {
+        var metas = buildMetas(it)
+        if (metas.length > 0) { startPlayback(metas, 0); return }
+      }
+      if (it.drillable) { drill(); return }
+      return
+    }
     if (tab === "queue") {
       // Waiting queue item: jump to it (earlier ones are consumed).
       if (it.queueIndex !== undefined && it.queueIndex !== null) {
@@ -606,9 +631,39 @@ Panel {
     requestScroll(cursorPos)
   }
 
-  // Selection feedback: a short accent label on the acted-on row.
+  // Selection feedback: a short accent label on the acted-on row, placed
+  // left of the heart icon so the two never overlap.
   property var actionFlash: null
   Timer { id: flashTimer; interval: 1400; onTriggered: root.actionFlash = null }
+
+  // ---- favorites. The daemon pushes the full favorite-id set on login
+  //      and after every toggle.
+  readonly property var favSet: {
+    var m = {}
+    var ids = snap.favorite_ids || []
+    for (var i = 0; i < ids.length; i++) m[ids[i]] = true
+    return m
+  }
+
+  function toggleFavoriteId(id, flashRaw) {
+    if (!id) return
+    if (!connected) {
+      flashAction(flashRaw, "offline — favorites need a daemon connection")
+      return
+    }
+    send({ type: "toggle_favorite", item_id: id })
+    flashAction(flashRaw, favSet[id] ? "unfavorited" : "favorited")
+  }
+
+  function toggleFavoriteSelected() {
+    var it = items[cursorPos]
+    var id = it ? (it.trackId !== undefined ? it.trackId : it.favId) : null
+    toggleFavoriteId(id, it ? it.raw : undefined)
+  }
+
+  function toggleFavoriteNow() {
+    toggleFavoriteId(now.id, undefined)
+  }
 
   function startFilter() {
     // The queue tab is a live view of daemon state — no filter there.
@@ -623,7 +678,15 @@ Panel {
     nf[tab] = filterInput.text
     filterTexts = nf
     filtering = false
-    Qt.callLater(function() { keyFocus.forceActiveFocus() })
+    // A committed filter is a fresh view: start at the top. The cursor
+    // identity must be pinned to the top row of the FILTERED list once
+    // it settles, so exiting the filter later lands on this same item
+    // (not the top of the unfiltered list).
+    resetViewCursor()
+    Qt.callLater(function() {
+      keyFocus.forceActiveFocus()
+      if (items[cursorPos]) lastRaw = items[cursorPos].raw
+    })
   }
 
   function cancelFilter() {
@@ -633,10 +696,16 @@ Panel {
 
   function clearFilter() {
     filtering = false
+    var had = filterTexts[tab] !== ""
     var nf = {}
     for (var k in filterTexts) nf[k] = filterTexts[k]
     nf[tab] = ""
     filterTexts = nf
+    // Exiting a committed filter is not a view change: park the cursor
+    // back on the same item selected in the filtered view, wherever it
+    // sits in the full list. (Drill/pop/tab flows call this first, then
+    // re-target the cursor themselves — those run after and win.)
+    if (had) focusRaw(lastRaw, 0)
   }
 
   // ---- contextual hint bar
@@ -650,8 +719,8 @@ Panel {
     if (tab === "queue" && it && it.queueIndex !== undefined)
       h += " · enter jump · d remove · J/K move"
     else if (it && it.kind === "track")
-      h += " · q queue · p play next"
-    h += " · h out" + (tab === "queue" ? "" : " · / filter") + " · [/] tabs" + (root.canFocusPlaying ? " · o playing" : "") + " · space play/pause · n/N next/prev · ,/. seek · s shuffle · r repeat · esc close"
+      h += " · q queue · p play next · f favorite"
+    h += " · h out" + (tab === "queue" ? "" : " · / filter") + " · tab/H/L tabs" + (root.canFocusPlaying ? " · o playing" : "") + " · space play/pause · n/N next/prev · ,/. seek · s shuffle · r repeat · F fav playing · esc close"
     return h
   }
 
@@ -759,15 +828,17 @@ Panel {
         if (t === "q") { root.queueTail(); event.accepted = true; return }
         if (t === "p") { root.queueHead(); event.accepted = true; return }
         if (t === "d") { root.removeQueueItem(); event.accepted = true; return }
+        if (t === "f") { root.toggleFavoriteSelected(); event.accepted = true; return }
+        if (t === "F") { root.toggleFavoriteNow(); event.accepted = true; return }
         if (t === "J") { root.moveQueueItem(1); event.accepted = true; return }
         if (t === "K") { root.moveQueueItem(-1); event.accepted = true; return }
         if (t === "/") { root.startFilter(); event.accepted = true; return }
         if (t === "o") { root.focusPlaying(); event.accepted = true; return }
-        if (t === "Q") { root.switchTab("queue"); event.accepted = true; return }
-        if (t === "A") { root.switchTab("albums"); event.accepted = true; return }
-        if (t === "P") { root.switchTab("playlists"); event.accepted = true; return }
-        if (event.key === Qt.Key_BracketLeft) { root.cycleTab(-1); event.accepted = true; return }
-        if (event.key === Qt.Key_BracketRight) { root.cycleTab(1); event.accepted = true; return }
+        if (t === "H") { root.cycleTab(-1); event.accepted = true; return }
+        if (t === "L") { root.cycleTab(1); event.accepted = true; return }
+        if (event.key === Qt.Key_Tab && !event.isAutoRepeat) { root.cycleTab(1); event.accepted = true; return }
+        // Shift+Tab arrives as Backtab, not Tab+Shift.
+        if (event.key === Qt.Key_Backtab && !event.isAutoRepeat) { root.cycleTab(-1); event.accepted = true; return }
       }
     }
 
@@ -787,9 +858,9 @@ Panel {
         spacing: Style.space(10)
 
         Repeater {
-          model: [ { key: "Q", id: "queue", label: "Queue" },
-                   { key: "A", id: "albums", label: "Albums" },
-                   { key: "P", id: "playlists", label: "Playlists" } ]
+          model: [ { id: "queue", label: "󰐑 Queue" },
+                   { id: "albums", label: "󰀥 Albums" },
+                   { id: "playlists", label: "󰲸 Playlists" } ]
 
           delegate: Rectangle {
             required property var modelData
@@ -868,7 +939,7 @@ Panel {
         anchors.top: parent.top
         anchors.bottom: parent.bottom
         anchors.left: parent.left
-        width: parent.width - Style.space(36)
+        width: parent.width - Style.space(18)
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         model: root.items
@@ -1028,7 +1099,8 @@ Panel {
           Rectangle {
             visible: root.actionFlash !== null && root.actionFlash.raw === modelData.raw
             anchors.right: parent.right
-            anchors.rightMargin: Style.space(16)
+            // Clears the heart icon (which sits at rightMargin 8).
+            anchors.rightMargin: Style.space(30)
             anchors.verticalCenter: parent.verticalCenter
             radius: Style.cornerRadius
             color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.22)
@@ -1046,13 +1118,48 @@ Panel {
             }
           }
 
+          // Favorite heart: filled (accent) on favorited tracks; the
+          // empty outline only shows on the cursor row to keep the list
+          // clean.
+          Text {
+            readonly property bool isFav: root.favSet[modelData.favId] === true
+            readonly property bool onCursor: index === root.cursorPos && !root.filtering
+            visible: modelData.kind === "track" && (isFav || onCursor)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: isFav ? "󰋑" : "󰋕"
+            color: isFav ? Color.accent : Qt.darker(Color.foreground, 1.5)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
+
           Row {
             id: rowCol
             visible: modelData.kind !== "sep" && modelData.kind !== "section"
-            leftPadding: Style.space(16)
+            leftPadding: Style.space(8)
             rightPadding: Style.space(16)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(10)
+
+            // Reserved gutter: a fixed slot wide enough for the glyph plus
+            // 4px padding per side. Vertical alignment comes from the row,
+            // since the slot itself is deliberately height-less.
+            Item {
+              width: Style.space(16)
+              height: 1
+              Text {
+                visible: modelData.playing
+                y: (rowCol.height - height) / 2
+                x: (parent.width - width) / 2
+                textFormat: Text.PlainText
+                text: "󰐌"
+                color: Color.accent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+              }
+            }
 
             Image {
               id: rowImg
@@ -1075,7 +1182,7 @@ Panel {
 
               Text {
                 textFormat: Text.PlainText
-                text: modelData.kind === "head" ? "󰐊  " + modelData.title : modelData.title
+                text: modelData.title
                 color: modelData.playing ? Color.accent : Color.foreground
                 font.family: Style.font.family
                 font.pixelSize: Style.font.body
@@ -1103,10 +1210,10 @@ Panel {
       // content's actual laid-out extents rather than estimated sizes.
       Rectangle {
         visible: list.contentHeight > list.height + 1
-        x: parent.width - Style.space(20)
-        y: Style.space(6)
+        x: parent.width - width
+        y: 0
         width: Style.space(4)
-        height: parent.height - Style.space(12)
+        height: parent.height
         radius: width / 2
         color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.10)
 

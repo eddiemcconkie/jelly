@@ -59,6 +59,8 @@ pub struct MediaItem {
     pub image_tags: Option<ImageTags>,
     #[serde(rename = "MediaSources", default)]
     pub media_sources: Option<Vec<MediaSource>>,
+    #[serde(rename = "UserData", default)]
+    pub user_data: Option<UserData>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -81,6 +83,12 @@ pub struct ItemsResponse {
     pub total: i64,
     #[serde(rename = "Items", default)]
     pub items: Vec<MediaItem>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+struct UserData {
+    is_favorite: Option<bool>,
 }
 
 impl JellyfinClient {
@@ -175,6 +183,50 @@ impl JellyfinClient {
             "{}/Audio/{item_id}/stream?static=true&api_key={token}",
             self.base_url
         ))
+    }
+
+    /// Toggle the favorite flag on one item; returns the NEW state.
+    /// Reads the current flag from the item, then POSTs (add) or DELETEs.
+    pub async fn toggle_favorite(&self, item_id: &str) -> Result<bool> {
+        let user_id = self.user_id.as_deref().context("not authenticated")?;
+        let item: MediaItem = self
+            .get_json(&format!("/Users/{user_id}/Items/{item_id}"), &[])
+            .await?;
+        let fav = item.user_data.and_then(|u| u.is_favorite).unwrap_or(false);
+        let url = format!("{}/Users/{user_id}/FavoriteItems/{item_id}", self.base_url);
+        let req = if fav {
+            self.http.delete(&url)
+        } else {
+            self.http.post(&url)
+        };
+        let resp = req
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .with_context(|| format!("favorite toggle failed for {item_id}"))?;
+        if !resp.status().is_success() {
+            anyhow::bail!("favorite toggle: HTTP {}", resp.status());
+        }
+        Ok(!fav)
+    }
+
+    /// All favorited songs for the user (ids only, enough for heart icons).
+    pub async fn favorite_ids(&self) -> Result<Vec<String>> {
+        let user_id = self.user_id.as_deref().context("not authenticated")?;
+        let resp: ItemsResponse = self
+            .get_json(
+                "/Items",
+                &[
+                    ("userId", user_id),
+                    ("filters", "IsFavorite"),
+                    ("includeItemTypes", "Audio"),
+                    ("recursive", "true"),
+                    ("fields", "MediaSources,Artists"),
+                    ("limit", "1000"),
+                ],
+            )
+            .await?;
+        Ok(resp.items.into_iter().map(|i| i.id).collect())
     }
 
     pub fn image_url(&self, item: &MediaItem) -> Option<String> {

@@ -275,6 +275,10 @@ fn handle_client_msg(
             let _ = cmd_tx.send(AppCommand::MoveQueue { index, delta, req_id });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
+        ClientKind::ToggleFavorite { item_id } => {
+            let _ = cmd_tx.send(AppCommand::ToggleFavorite { item_id, req_id });
+            vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
+        }
         ClientKind::SetRepeat { mode } => {
             let _ = cmd_tx.send(AppCommand::SetRepeat(mode));
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]

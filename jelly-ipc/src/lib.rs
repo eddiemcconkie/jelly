@@ -84,6 +84,9 @@ pub enum ClientKind {
     SetRepeat { mode: RepeatMode },
     /// Toggles a fixed permutation of the context order only.
     SetShuffle { on: bool },
+    /// Toggle the favorite flag on one item (online only). The daemon
+    /// refreshes and pushes the favorite set on success.
+    ToggleFavorite { item_id: String },
 }
 
 /// Daemon → client envelope: one of `DaemonKind` plus `req_id` echoed
@@ -246,6 +249,10 @@ pub struct PlaybackSnapshot {
     /// Filled when auth is not `authenticated`.
     #[serde(default)]
     pub auth: Option<AuthStatus>,
+    /// Ids of the user's favorited songs (heart icons). Refreshed on
+    /// login and after every successful toggle.
+    #[serde(default)]
+    pub favorite_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -271,6 +278,7 @@ impl Default for PlaybackSnapshot {
             repeat: RepeatMode::Off,
             library_rev: 0,
             auth: None,
+            favorite_ids: Vec::new(),
         }
     }
 }
@@ -415,5 +423,24 @@ mod tests {
         assert!(json.contains("\"queue_head\""));
         let back: DaemonMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.kind, DaemonKind::State(Box::new(snap)));
+    }
+
+    #[test]
+    fn toggle_favorite_round_trips() {
+        let msg = ClientMessage::new(ClientKind::ToggleFavorite { item_id: "t1".into() }, Some(5));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"toggle_favorite\""));
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn snapshot_carries_favorite_ids() {
+        let mut snap = PlaybackSnapshot::default();
+        snap.favorite_ids = vec!["a".into(), "b".into()];
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"favorite_ids\""));
+        let back: PlaybackSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.favorite_ids, vec!["a".to_string(), "b".to_string()]);
     }
 }
