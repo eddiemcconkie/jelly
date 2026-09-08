@@ -34,7 +34,8 @@ pub enum ClientKind {
     /// Ask daemon to (re)authenticate. Password comes from rbw; the daemon
     /// never accepts a password over the socket.
     Login,
-    /// Replace the queue and start playing at `start_index`.
+    /// Replace the playback context (loaded album/playlist) and start
+    /// playing at `start_index`. Any waiting queue survives.
     Play {
         tracks: Vec<TrackMeta>,
         #[serde(default)]
@@ -44,13 +45,18 @@ pub enum ClientKind {
     Resume,
     TogglePlay,
     Stop,
+    /// Advance. Plays the queue head if one is waiting, else walks the
+    /// playback context (wrap under repeat-all; stop cleanly at the end
+    /// with repeat off).
     Next,
+    /// Backward. The daemon applies the 5s rule (restart vs previous) and
+    /// repeat-all edge wrap; never mutates the queue.
     Prev,
     /// Seek to an absolute position in seconds.
     Seek { position_secs: f64 },
     /// Volume 0..=100.
     SetVolume { volume: u8 },
-    /// Full snapshot of playback + queue.
+    /// Full snapshot of playback + context + queue.
     GetState,
     // --- Browse (typed views, lazy fetch; no pagination in v1) ---
     /// Album artists — the top of the browse tree.
@@ -63,16 +69,20 @@ pub enum ClientKind {
     BrowsePlaylists,
     /// Items of one playlist.
     BrowsePlaylistTracks { playlist_id: String },
-    // --- Queue editing ---
-    /// Append tracks to the end of the queue (starts playing if stopped).
+    // --- Queue editing (the queue only; the context is immutable) ---
+    /// Append tracks to the tail of the queue (starts playing if stopped
+    /// and nothing else is queued).
     Enqueue { items: Vec<TrackMeta> },
-    /// Insert one track to play right after the current one.
+    /// Insert one track at the head of the queue (plays next).
     PlayNext { item: TrackMeta },
-    /// Make the track at `index` the current one.
+    /// Jump to a waiting queue item; earlier waiting items are consumed.
     JumpTo { index: usize },
-    /// Remove the track at `index` (refused for the playing track).
+    /// Remove the waiting queue item at `index`.
     RemoveFromQueue { index: usize },
+    /// Move the waiting queue item at `index` by -1 or +1 (clamped).
+    MoveQueue { index: usize, delta: i32 },
     SetRepeat { mode: RepeatMode },
+    /// Toggles a fixed permutation of the context order only.
     SetShuffle { on: bool },
 }
 
@@ -186,11 +196,40 @@ pub enum PlaybackStatus {
     Playing,
 }
 
+/// The loaded album or playlist. Immutable while loaded; selecting a song
+/// inside one replaces the context (the queue survives).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextSnapshot {
+    /// Display name (album or playlist title).
+    pub name: String,
+    /// Artist line for albums; empty for playlists.
+    #[serde(default)]
+    pub artist: String,
+    /// Cover image URL, if any.
+    #[serde(default)]
+    pub image_url: Option<String>,
+    /// Full track list in context order (already permuted when shuffle is
+    /// on, so `current_index` walks the shuffled order too).
+    pub tracks: Vec<TrackMeta>,
+    /// Position of the current track within `tracks`.
+    #[serde(default)]
+    pub current_index: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlaybackSnapshot {
     pub status: PlaybackStatus,
-    /// Index into the queue of the current track, if any.
-    pub current_index: Option<usize>,
+    /// The loaded playback context, if any.
+    #[serde(default)]
+    pub context: Option<ContextSnapshot>,
+    /// The currently-playing track, whatever tier it came from.
+    #[serde(default)]
+    pub current: Option<TrackMeta>,
+    /// The current queue song (the head), when playing from the queue.
+    #[serde(default)]
+    pub queue_head: Option<TrackMeta>,
+    /// Waiting queue items, in FIFO order (head excluded).
+    #[serde(default)]
     pub queue: Vec<TrackMeta>,
     /// Position of the current track in seconds.
     pub position_secs: f64,
@@ -221,7 +260,9 @@ impl Default for PlaybackSnapshot {
     fn default() -> Self {
         Self {
             status: PlaybackStatus::Stopped,
-            current_index: None,
+            context: None,
+            current: None,
+            queue_head: None,
             queue: Vec::new(),
             position_secs: 0.0,
             duration_secs: None,
@@ -332,5 +373,47 @@ mod tests {
     fn auth_status_is_snake_case() {
         let json = serde_json::to_string(&AuthStatus::NeedsUnlock).unwrap();
         assert_eq!(json, "\"needs_unlock\"");
+    }
+
+    #[test]
+    fn move_queue_command_round_trips() {
+        let msg = ClientMessage::new(ClientKind::MoveQueue { index: 2, delta: -1 }, Some(9));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"move_queue\""));
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// The two-tier snapshot: context + head + waiting queue.
+    #[test]
+    fn two_tier_snapshot_round_trips() {
+        let track = |id: &str| TrackMeta {
+            id: id.into(),
+            name: format!("Song {id}"),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_secs: Some(200.0),
+            image_url: None,
+            stream_url: String::new(),
+        };
+        let snap = PlaybackSnapshot {
+            context: Some(ContextSnapshot {
+                name: "Album".into(),
+                artist: "Artist".into(),
+                image_url: None,
+                tracks: vec![track("t1"), track("t2"), track("t3")],
+                current_index: Some(0),
+            }),
+            current: Some(track("t1")),
+            queue_head: Some(track("q0")),
+            queue: vec![track("q1"), track("q2")],
+            ..Default::default()
+        };
+        let msg = DaemonMessage::new(DaemonKind::State(Box::new(snap.clone())), None);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"context\""));
+        assert!(json.contains("\"queue_head\""));
+        let back: DaemonMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, DaemonKind::State(Box::new(snap)));
     }
 }

@@ -1,11 +1,18 @@
 //! Commands accepted from any front door (socket clients and MPRIS).
+//!
+//! The coordinator owns the two-tier playback model (model.rs): every
+//! transition is decided here and driven into the engine (which plays one
+//! track at a time). The watch-shared snapshot is derived from the model.
 
 use crate::server::BrowseRequest;
-use jelly_ipc::ClientMessage;
-use jelly_ipc::{ClientKind, ErrorCode, PlaybackSnapshot, RepeatMode, TrackMeta};
+use jelly_ipc::{ClientMessage};
+use jelly_ipc::{ClientKind, ErrorCode, PlaybackSnapshot, PlaybackStatus, RepeatMode, TrackMeta};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum AppCommand {
+    /// Replace the playback context and start playing at `start_index`.
+    /// The queue survives.
     Play { tracks: Vec<TrackMeta>, start_index: usize },
     Pause,
     Resume,
@@ -17,16 +24,17 @@ pub enum AppCommand {
     SetVolume(u8),
     SetRepeat(RepeatMode),
     SetShuffle(bool),
-    /// Append tracks to the queue (starts playing if stopped).
+    /// Append tracks to the tail of the queue (starts playing if idle).
     Enqueue { items: Vec<TrackMeta> },
-    /// Insert a track to play right after the current one.
+    /// Insert a track at the head of the queue (plays next).
     PlayNext { item: TrackMeta },
-    /// Make the track at this queue index the current one. `req_id` rides
-    /// along so a refused jump can be echoed back to its requester.
+    /// Jump to a waiting queue item, consuming earlier ones. `req_id`
+    /// rides along so a refusal can be echoed to its requester.
     JumpTo { index: usize, req_id: Option<u64> },
-    /// Remove the track at this queue index. `req_id` rides along so a
-    /// refusal can be echoed back to its requester.
+    /// Remove the waiting queue item at this index.
     RemoveFromQueue { index: usize, req_id: Option<u64> },
+    /// Move the waiting queue item at `index` by `delta` slots (clamped).
+    MoveQueue { index: usize, delta: i32, req_id: Option<u64> },
     /// Re-authenticate using rbw-stored credentials.
     Login,
 }
@@ -45,22 +53,44 @@ pub struct Coordinator {
     pub server_url: String,
     /// Self-enqueue path for the unlock-retry task.
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<AppCommand>,
+    /// The two-tier playback model — the source of truth.
+    pub model: crate::model::PlaybackModel,
+    /// Last observed engine facts (mirrored into snapshots).
+    pub position_secs: f64,
+    pub duration_secs: Option<f64>,
+    pub volume: u8,
+    pub status: PlaybackStatus,
 }
 
-use jelly_ipc::{AuthStatus, DaemonKind, DaemonMessage, PlaybackStatus};
-use std::sync::Arc;
+use jelly_ipc::{AuthStatus, DaemonKind, DaemonMessage};
 
 impl Coordinator {
     pub fn snapshot(&self) -> Arc<PlaybackSnapshot> {
         crate::state::snapshot(&self.state_rx)
     }
 
+    /// Derive the wire snapshot from the model + engine facts.
+    pub fn build_snapshot(&self) -> PlaybackSnapshot {
+        let (context, head, queue) = self.model.snapshot_parts();
+        let current = self.model.current();
+        PlaybackSnapshot {
+            status: self.status,
+            context,
+            current,
+            queue_head: head,
+            queue,
+            position_secs: self.position_secs,
+            duration_secs: self.duration_secs,
+            volume: self.volume,
+            shuffle: self.model.shuffle,
+            repeat: self.model.repeat,
+            library_rev: crate::state::LIBRARY_REV,
+            auth: Some(*self.auth_rx.borrow()),
+        }
+    }
+
     pub async fn push_state(&self, old: &PlaybackSnapshot) {
-        // Stamp the latest auth status into the snapshot (single source of
-        // truth for the wire).
-        let mut snap = (*self.snapshot()).clone();
-        snap.auth = Some(*self.auth_rx.borrow());
-        let snap = Arc::new(snap);
+        let snap = Arc::new(self.build_snapshot());
         let _ = self.state_tx.send(snap.clone());
         let _ = self
             .broadcast_tx
@@ -73,76 +103,115 @@ impl Coordinator {
         }
     }
 
+    /// Apply a model transition to the engine.
+    fn apply(&mut self, t: crate::model::Transition) {
+        use crate::model::Transition;
+        match t {
+            Transition::Play(track) => {
+                self.position_secs = 0.0;
+                self.duration_secs = track.duration_secs;
+                self.engine
+                    .send(crate::playback::EngineCommand::PlayUrl(track.stream_url.clone()));
+                self.status = PlaybackStatus::Playing;
+            }
+            Transition::Stop => {
+                self.engine.send(crate::playback::EngineCommand::Stop);
+                self.status = PlaybackStatus::Stopped;
+                self.position_secs = 0.0;
+            }
+            // 5s-rule restart: rewind the current track.
+            Transition::Stay => {
+                self.position_secs = 0.0;
+                self.engine.send(crate::playback::EngineCommand::Seek(0.0));
+            }
+        }
+    }
+
     pub async fn handle_cmd(&mut self, cmd: AppCommand) {
-        let old = (*self.snapshot()).clone();
+        let old = self.build_snapshot();
         match cmd {
             AppCommand::Login => self.login().await,
             AppCommand::Play { mut tracks, start_index } => {
-                // Rebuild stream URLs server-side; the client only knows ids.
                 self.rebuild_stream_urls(&mut tracks);
-                let urls: Vec<String> = tracks.iter().map(|t| t.stream_url.clone()).collect();
-                self.engine.send(crate::playback::EngineCommand::PlayUrls { urls, start_index });
-                let mut snap = (*self.snapshot()).clone();
-                snap.queue = tracks;
-                snap.current_index = Some(start_index);
-                self.state_tx.send_replace(Arc::new(snap));
+                if tracks.is_empty() {
+                    return;
+                }
+                let name = tracks[0].album.clone();
+                let artist = tracks[0].artist.clone();
+                let image = tracks[0].image_url.clone();
+                let t = self.model.set_context(name, artist, image, tracks, start_index);
+                self.apply(t);
             }
-            AppCommand::Pause => self.engine.send(crate::playback::EngineCommand::Pause),
-            AppCommand::Resume => self.engine.send(crate::playback::EngineCommand::Unpause),
+            AppCommand::Pause => {
+                self.engine.send(crate::playback::EngineCommand::Pause);
+                self.status = PlaybackStatus::Paused;
+            }
+            AppCommand::Resume => {
+                self.engine.send(crate::playback::EngineCommand::Unpause);
+                self.status = PlaybackStatus::Playing;
+            }
             AppCommand::Toggle => self.engine.send(crate::playback::EngineCommand::Toggle),
-            AppCommand::Stop => self.engine.send(crate::playback::EngineCommand::Stop),
-            AppCommand::Next => self.engine.send(crate::playback::EngineCommand::Next),
-            AppCommand::Prev => self.engine.send(crate::playback::EngineCommand::Prev),
-            AppCommand::Seek(pos) => self.engine.send(crate::playback::EngineCommand::Seek(pos)),
+            AppCommand::Stop => {
+                self.engine.send(crate::playback::EngineCommand::Stop);
+                self.status = PlaybackStatus::Stopped;
+            }
+            AppCommand::Next => {
+                let t = self.model.next();
+                self.apply(t);
+            }
+            AppCommand::Prev => {
+                let t = self.model.prev(self.position_secs);
+                self.apply(t);
+            }
+            AppCommand::Seek(pos) => {
+                self.position_secs = pos.max(0.0);
+                self.engine.send(crate::playback::EngineCommand::Seek(self.position_secs));
+            }
             AppCommand::SetVolume(v) => {
+                self.volume = v;
                 self.engine.send(crate::playback::EngineCommand::SetVolume(v));
-                let mut snap = (*self.snapshot()).clone();
-                snap.volume = v;
-                self.state_tx.send_replace(Arc::new(snap));
             }
             AppCommand::SetRepeat(mode) => {
-                self.engine.send(crate::playback::EngineCommand::SetRepeat(mode));
-                let mut snap = (*self.snapshot()).clone();
-                snap.repeat = mode;
-                self.state_tx.send_replace(Arc::new(snap));
+                self.model.repeat = mode;
+                // loop-file natively repeats the single track (repeat-one);
+                // repeat-all wrap and off/stop are the model's decisions.
+                self.engine
+                    .send(crate::playback::EngineCommand::SetLoopFile(mode == RepeatMode::One));
             }
             AppCommand::SetShuffle(on) => {
-                // v1: shuffle is a UI/MPRIS flag only. True shuffled order
-                // needs queue ownership to move (mpv's playlist-shuffle
-                // would desync our index mapping); deferred until the
-                // queue lives in one place.
-                let mut snap = (*self.snapshot()).clone();
-                snap.shuffle = on;
-                self.state_tx.send_replace(Arc::new(snap));
+                self.model.set_shuffle(on);
             }
             AppCommand::Enqueue { mut items } => {
                 self.rebuild_stream_urls(&mut items);
-                let urls: Vec<String> = items.iter().map(|t| t.stream_url.clone()).collect();
-                self.engine.send(crate::playback::EngineCommand::Enqueue(urls));
-                let mut snap = (*self.snapshot()).clone();
-                snap.queue.extend(items);
-                self.state_tx.send_replace(Arc::new(snap));
+                let idle = self.model.head.is_none() && self.model.queue.is_empty();
+                let stopped = self.status == PlaybackStatus::Stopped;
+                self.model.enqueue(items);
+                // Nothing was queued and nothing is playing: start now.
+                if idle && stopped {
+                    let t = self.model.next();
+                    self.apply(t);
+                }
             }
             AppCommand::PlayNext { mut item } => {
                 self.rebuild_stream_urls(std::slice::from_mut(&mut item));
-                self.engine
-                    .send(crate::playback::EngineCommand::InsertNext(item.stream_url.clone()));
-                let mut snap = (*self.snapshot()).clone();
-                let insert_at = snap.current_index.map(|i| i + 1).unwrap_or(0);
-                snap.queue.insert(insert_at, item);
-                self.state_tx.send_replace(Arc::new(snap));
+                self.model.play_next(item);
             }
-            AppCommand::JumpTo { index, req_id } => {
-                let in_range = self.snapshot().queue.get(index).is_some();
-                if in_range {
-                    self.engine
-                        .send(crate::playback::EngineCommand::JumpTo(index));
-                    let mut snap = (*self.snapshot()).clone();
-                    snap.current_index = Some(index);
-                    snap.position_secs = 0.0;
-                    snap.duration_secs = snap.queue.get(index).and_then(|t| t.duration_secs);
-                    self.state_tx.send_replace(Arc::new(snap));
-                } else {
+            AppCommand::JumpTo { index, req_id } => match self.model.jump(index) {
+                Some(item) => {
+                    self.apply(crate::model::Transition::Play(item));
+                }
+                None => {
+                    let _ = self.broadcast_tx.send(DaemonMessage::new(
+                        DaemonKind::Error {
+                            code: ErrorCode::NotFound,
+                            message: format!("queue index {index} does not exist"),
+                        },
+                        req_id,
+                    ));
+                }
+            },
+            AppCommand::RemoveFromQueue { index, req_id } => {
+                if self.model.remove(index).is_none() {
                     let _ = self.broadcast_tx.send(DaemonMessage::new(
                         DaemonKind::Error {
                             code: ErrorCode::NotFound,
@@ -152,35 +221,15 @@ impl Coordinator {
                     ));
                 }
             }
-            AppCommand::RemoveFromQueue { index, req_id } => {
-                let snap = (*self.snapshot()).clone();
-                if index >= snap.queue.len() {
-                    let _ = self.broadcast_tx.send(DaemonMessage::new(
-                        DaemonKind::Error {
-                            code: ErrorCode::NotFound,
-                            message: format!("queue index {index} does not exist"),
-                        },
-                        req_id,
-                    ));
-                } else if Some(index) == snap.current_index {
+            AppCommand::MoveQueue { index, delta, req_id } => {
+                if !self.model.move_item(index, delta) {
                     let _ = self.broadcast_tx.send(DaemonMessage::new(
                         DaemonKind::Error {
                             code: ErrorCode::Invalid,
-                            message: "cannot remove the playing track".into(),
+                            message: format!("cannot move queue index {index} by {delta}"),
                         },
                         req_id,
                     ));
-                } else {
-                    self.engine
-                        .send(crate::playback::EngineCommand::RemoveAt(index));
-                    let mut snap2 = snap.clone();
-                    snap2.queue.remove(index);
-                    if let Some(cur) = snap2.current_index {
-                        if index < cur {
-                            snap2.current_index = Some(cur - 1);
-                        }
-                    }
-                    self.state_tx.send_replace(Arc::new(snap2));
                 }
             }
         }
@@ -258,7 +307,7 @@ impl Coordinator {
     }
 
     async fn login(&mut self) {
-        let old = (*self.snapshot()).clone();
+        let old = self.build_snapshot();
         if !crate::rbw::unlocked().await {
             tracing::info!("rbw locked; spawning rbw unlock for a pinentry prompt");
             let _ = self.auth_tx.send(AuthStatus::NeedsUnlock);
@@ -308,18 +357,16 @@ impl Coordinator {
     }
 
     pub async fn handle_engine_event(&mut self, ev: crate::playback::EngineEvent) {
-        let old = (*self.snapshot()).clone();
-        let mut snap = (*self.snapshot()).clone();
+        let old = self.build_snapshot();
         match ev {
             crate::playback::EngineEvent::Status(status) => {
-                snap.status = status;
-                if status == PlaybackStatus::Stopped {
-                    snap.position_secs = 0.0;
-                }
+                self.status = status;
             }
             crate::playback::EngineEvent::Position(pos) => {
                 // High-frequency: update the shared snapshot and send only
                 // the small Position message. No State broadcast, no MPRIS.
+                self.position_secs = pos;
+                let mut snap = self.build_snapshot();
                 snap.position_secs = pos;
                 self.state_tx.send_replace(Arc::new(snap));
                 let _ = self
@@ -328,15 +375,10 @@ impl Coordinator {
                 return;
             }
             crate::playback::EngineEvent::Duration(d) => {
-                snap.duration_secs = Some(d);
-                if let Some(i) = snap.current_index {
-                    if let Some(t) = snap.queue.get_mut(i) {
-                        t.duration_secs = Some(d);
-                    }
-                }
+                self.duration_secs = Some(d);
             }
             crate::playback::EngineEvent::LoadFailed => {
-                // Tell clients; keep state as-is (mpv will advance or idle).
+                // Tell clients; keep state as-is.
                 let _ = self.broadcast_tx.send(DaemonMessage::new(
                     DaemonKind::Error {
                         code: ErrorCode::Internal,
@@ -346,13 +388,13 @@ impl Coordinator {
                 ));
                 return;
             }
-            crate::playback::EngineEvent::TrackChanged(i) => {
-                snap.current_index = Some(i);
-                snap.position_secs = 0.0;
-                snap.duration_secs = snap.queue.get(i).and_then(|t| t.duration_secs);
+            crate::playback::EngineEvent::TrackEnded => {
+                // The model owns the transition (queue head, context walk,
+                // wrap, stop). Repeat-one never gets here (loop-file).
+                let t = self.model.track_ended();
+                self.apply(t);
             }
         }
-        self.state_tx.send_replace(Arc::new(snap));
         self.push_state(&old).await;
     }
 

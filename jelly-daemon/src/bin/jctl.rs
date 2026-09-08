@@ -132,6 +132,13 @@ fn build_message(args: &[String]) -> (ClientKind, Option<u64>) {
             },
             req_id,
         ),
+        Some("mv") => (
+            K::MoveQueue {
+                index: args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
+                delta: args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1),
+            },
+            req_id,
+        ),
         Some("repeat") => (
             K::SetRepeat {
                 mode: match args.get(1).map(String::as_str) {

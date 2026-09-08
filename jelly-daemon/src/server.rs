@@ -271,6 +271,10 @@ fn handle_client_msg(
             let _ = cmd_tx.send(AppCommand::RemoveFromQueue { index, req_id });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
+        ClientKind::MoveQueue { index, delta } => {
+            let _ = cmd_tx.send(AppCommand::MoveQueue { index, delta, req_id });
+            vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
+        }
         ClientKind::SetRepeat { mode } => {
             let _ = cmd_tx.send(AppCommand::SetRepeat(mode));
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]

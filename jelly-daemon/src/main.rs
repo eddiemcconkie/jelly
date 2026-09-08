@@ -41,6 +41,11 @@ async fn main() -> Result<()> {
         mpris: mpris_handle,
         server_url: server_url.clone(),
         cmd_tx: cmd_tx.clone(),
+        model: jelly_daemon::model::PlaybackModel::new(),
+        position_secs: 0.0,
+        duration_secs: None,
+        volume: 100,
+        status: jelly_ipc::PlaybackStatus::Stopped,
     };
 
     // Try a silent login (never prompts; needs rbw unlocked).

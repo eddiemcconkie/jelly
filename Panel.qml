@@ -19,38 +19,39 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  // ---- daemon snapshot: THE playback truth
-  property var snap: ({ status: "stopped", queue: [], current_index: null, volume: 100 })
+  // ---- daemon snapshot: THE playback truth (two-tier model:
+  //      snap.context = loaded album/playlist, snap.queue + queue_head =
+  //      the temporary queue)
+  property var snap: ({ status: "stopped", queue: [], queue_head: null, current: null, context: null, volume: 100 })
   property real position: 0
   readonly property bool playing: snap.status === "playing"
   readonly property bool connected: sock !== null && sock.connected
-  readonly property var now: {
-    var q = snap.queue || [], i = snap.current_index
-    if (i !== null && i !== undefined && q.length > 0 && i < q.length) return q[i]
-    return { id: "", name: connected ? "Nothing playing" : "Daemon offline", artist: "", album: "" }
-  }
+  readonly property var nowTrack: snap.current || snap.queue_head || null
+  readonly property var now: nowTrack
+    ? nowTrack
+    : ({ id: "", name: connected ? "Nothing playing" : "Daemon offline", artist: "", album: "" })
+  readonly property var nowCtx: snap.context || null
   readonly property real duration: {
-    var q = snap.queue, i = snap.current_index
-    if (i !== null && i !== undefined && q.length > 0 && i < q.length) {
-      var t = q[i]
-      if (t.duration_secs) return t.duration_secs
-    }
-    return snap.duration_secs || 0
+    if (snap.duration_secs) return snap.duration_secs
+    return (nowTrack && nowTrack.duration_secs) || 0
   }
   readonly property string pillGlyph: playing ? "󰏤" : "󰐊"
-  readonly property string pillText: now.name + (now.album ? " — " + now.album : "")
-  readonly property string nowCover: coverByAlbum(now.album)
+  readonly property string pillText:
+    now.name + (nowCtx && nowCtx.name ? " — " + nowCtx.name : (now.album ? " — " + now.album : ""))
+  readonly property string nowCover:
+    (nowCtx && nowCtx.image_url) || coverByAlbum(now.album)
 
   // ---- browse library (real dump from Jellyfin)
   property var library: ({ albums: [], playlists: [] })
   readonly property bool libraryLoaded: library.albums.length > 0
 
-  // Queue index of the playing track within the CURRENT view, or -1 when
-  // the playing track isn't visible here.
+  // Queue view: the playing track is the queue head, else find it among
+  // the visible track rows by id.
   function nowPlayingRaw() {
     if (!now || !now.id) return -1
+    // Queue tab: the playing row is matched by track id in focusPlaying.
+    if (tab === "queue") return now.id
     var t = tab, p = path
-    if (t === "queue") return snap.current_index !== null ? snap.current_index : -1
     if (t === "albums") {
       if (p.length >= 1) {
         var al = library.albums[p[0]]
@@ -237,12 +238,43 @@ Panel {
   function rawList() {
     var t = root.tab, p = root.path
     if (t === "queue") {
-      return snap.queue.map(function(tr, i) {
-        return { raw: i, cover: coverByAlbum(tr.album), title: tr.name,
-                 sub: (tr.album ? tr.album + "  ·  " : "") + (tr.artist || "") + "  ·  " + Mock.fmt(tr.duration_secs || 0),
-                 kind: "track", drillable: false, playing: i === snap.current_index,
-                 playTrackIds: snap.queue.map(function(q) { return q.id }), playStart: i }
-      })
+      // Two tiers: the queue (pinned head + waiting items), a rule, then
+      // the remaining playback-context tracks under a context header.
+      var out = []
+      var ctx = snap.context
+      var ctxCover = ctx && ctx.image_url ? ctx.image_url : ""
+      function row(tr, extra) {
+        var base = {
+          cover: coverByAlbum(tr.album) || (tr.image_url || ""),
+          title: tr.name,
+          sub: (tr.artist ? tr.artist : "") + (tr.duration_secs ? "  ·  " + Mock.fmt(tr.duration_secs) : ""),
+          kind: "track", drillable: false,
+          playing: tr.id === root.now.id && !root.snap.queue_head
+        }
+        for (var k in extra) base[k] = extra[k]
+        return base
+      }
+      // The current queue song is NOT listed — it lives in the now-playing
+      // bar at the bottom.
+      var waiting = snap.queue || []
+      if (waiting.length > 0)
+        out.push({ raw: "section-upnext", title: "Up next", sub: "", kind: "section",
+                   drillable: false, playing: false })
+      for (var i = 0; i < waiting.length; i++) {
+        out.push(row(waiting[i], { raw: waiting[i].id, trackId: waiting[i].id, queueIndex: i }))
+      }
+      if (ctx) {
+        // The rule only separates two non-empty sections.
+        if (waiting.length > 0)
+          out.push({ raw: "sep", title: "", sub: "", kind: "sep", drillable: false, playing: false })
+        out.push({ raw: "section-ctx", title: ctx.name, sub: ctx.artist || "", kind: "section",
+                   drillable: false, playing: false })
+        var tracks = ctx.tracks || []
+        for (var j = (ctx.current_index !== null && ctx.current_index !== undefined ? ctx.current_index + 1 : 0); j < tracks.length; j++) {
+          out.push(row(tracks[j], { raw: tracks[j].id, trackId: tracks[j].id, ctxIndex: j, metas: tracks }))
+        }
+      }
+      return out
     }
     if (t === "albums") {
       if (p.length === 0)
@@ -287,6 +319,24 @@ Panel {
         return it.title.toLowerCase().indexOf(filterText.toLowerCase()) >= 0
       })
 
+  // Only real rows take the cursor; pinned head / rule / section header
+  // are skipped.
+  function selectable(it) {
+    return it && (it.kind === "track" || it.drillable)
+  }
+
+  // Nearest selectable index at or after `pos`, searching outward.
+  function nearestSelectable(pos) {
+    if (items.length === 0) return -1
+    pos = Math.max(0, Math.min(pos, items.length - 1))
+    if (selectable(items[pos])) return pos
+    for (var d = 1; d < items.length; d++) {
+      if (pos + d < items.length && selectable(items[pos + d])) return pos + d
+      if (pos - d >= 0 && selectable(items[pos - d])) return pos - d
+    }
+    return -1
+  }
+
   // Keep the same underlying item focused when the list changes under a
   // filter (clearing or editing maps the cursor back via its raw index).
   // Cursor bookkeeping in one place: park cursorPos on whatever is actually
@@ -307,28 +357,45 @@ Panel {
     var before = cursorPos
     var idx = -1
     for (var i = 0; i < items.length; i++) if (items[i].raw === lastRaw) { idx = i; break }
-    cursorPos = idx >= 0 ? idx : Math.min(cursorPos, items.length - 1)
+    // Cursor identity lost (e.g. the selected queue head became the
+    // current song): land on the next selectable row.
+    var target = idx >= 0 ? idx : nearestSelectable(cursorPos)
+    if (target < 0) target = nearestSelectable(0)
+    cursorPos = target >= 0 ? target : 0
+    if (!selectable(items[cursorPos])) {
+      var ns = nearestSelectable(cursorPos)
+      cursorPos = ns >= 0 ? ns : 0
+    }
     lastRaw = items[cursorPos].raw
-    if (cursorPos !== before) requestScroll(cursorPos)
+    // Defer the scroll to after the new model has laid out: re-scrolling
+    // during a model reset positions against half-built geometry and
+    // lands mid-list (the "g jumps to the middle" bug).
+    if (cursorPos !== before) Qt.callLater(function() { root.requestScroll(cursorPos) })
   }
 
   function moveCursor(d) {
     if (items.length === 0) return
-    cursorPos = Math.max(0, Math.min(items.length - 1, cursorPos + d))
-    lastRaw = items[cursorPos].raw
-    requestScroll(cursorPos)
+    var pos = cursorPos
+    do { pos = Math.max(0, Math.min(items.length - 1, pos + d)) } while (!selectable(items[pos]) && pos > 0 && pos < items.length - 1)
+    if (!selectable(items[pos])) return
+    cursorPos = pos
+    lastRaw = items[pos].raw
+    requestScroll(pos)
   }
 
   function jumpCursor(pos) {
     if (items.length === 0) return
-    cursorPos = Math.max(0, Math.min(items.length - 1, pos))
-    lastRaw = items[cursorPos].raw
-    requestScroll(cursorPos)
+    var ns = nearestSelectable(pos)
+    if (ns < 0) return
+    cursorPos = ns
+    lastRaw = items[ns].raw
+    requestScroll(ns)
   }
 
   function clampCursor() {
     if (items.length === 0) { cursorPos = 0; return }
-    cursorPos = Math.min(cursorPos, items.length - 1)
+    var ns = nearestSelectable(cursorPos)
+    cursorPos = ns >= 0 ? ns : 0
     lastRaw = items[cursorPos].raw
   }
 
@@ -377,15 +444,37 @@ Panel {
     resetViewCursor()
   }
 
+  // Start a (re)selection: loading a fresh context resets repeat-one to
+  // plain repeat — nobody wants one song looping forever after picking a
+  // new album.
+  function startPlayback(tracks, startIndex) {
+    send({ type: "play", tracks: tracks, start_index: startIndex })
+    if (snap.repeat === "one") send({ type: "set_repeat", mode: "off" })
+  }
+
   function activate() {
     var it = items[cursorPos]
     if (!it) return
     if (it.drillable) { drill(); return }
+    if (it.kind !== "track") return
+    if (tab === "queue") {
+      // Waiting queue item: jump to it (earlier ones are consumed).
+      if (it.queueIndex !== undefined && it.queueIndex !== null) {
+        send({ type: "jump_to", index: it.queueIndex })
+        return
+      }
+      // Context track: restart the context at that song.
+      if (it.ctxIndex !== undefined && it.ctxIndex !== null && it.metas && it.metas.length > 0) {
+        startPlayback(it.metas, it.ctxIndex)
+        return
+      }
+      return
+    }
     // enter = play from here; daemon state push moves the UI
     if (!it.playTrackIds || it.playTrackIds.length === 0) return
     var metas = buildMetas(it)
     if (metas.length === 0) return
-    send({ type: "play", tracks: metas, start_index: it.playStart })
+    startPlayback(metas, it.playStart)
   }
 
   // TrackMeta list for the item's context (daemon rebuilds stream URLs from ids).
@@ -432,27 +521,101 @@ Panel {
     var np = nowPlayingRaw()
     if (np < 0) return
     for (var i = 0; i < items.length; i++) {
-      if (items[i].raw === np) {
+      if (selectable(items[i]) && (items[i].trackId !== undefined ? items[i].trackId : items[i].raw) === np) {
         cursorPos = i
-        lastRaw = np
+        lastRaw = items[i].raw
         requestScroll(i)
         return
       }
     }
   }
 
-  readonly property bool canFocusPlaying: nowPlayingRaw() >= 0
+  readonly property bool canFocusPlaying: nowPlayingRaw() !== -1
 
   function togglePlay() { send({ type: "toggle_play" }) }
-  function skip(dir) {
-    send(dir > 0 ? { type: "next" } : { type: "prev" })
-    if (snap.status === "paused") send({ type: "resume" })
-  }
+  function skip(dir) { send(dir > 0 ? { type: "next" } : { type: "prev" }) }
   function nextTrack() { skip(1) }
   function prevTrack() { skip(-1) }
   function seekBy(d) { send({ type: "seek", position_secs: Math.max(0, position + d) }) }
 
-  function startFilter() { filtering = true; Qt.callLater(function() { filterInput.forceActiveFocus() }) }
+  // ---- queue actions (q/p work on any track row; d/J/K only on waiting
+  //      queue items in the queue tab)
+  // TrackMeta for the cursor's track: queue/context rows carry wire metas
+  // already; browse rows go through buildMetas. Null when there's nothing
+  // queueable — including tracks already waiting in the queue.
+  function queuedIds() {
+    var ids = {}
+    if (snap.queue_head) ids[snap.queue_head.id] = true
+    var w = snap.queue || []
+    for (var i = 0; i < w.length; i++) ids[w[i].id] = true
+    return ids
+  }
+
+  function metaForQueueAction() {
+    var it = items[cursorPos]
+    if (!it || it.kind !== "track") return null
+    if (tab === "queue") {
+      if (it.queueIndex !== undefined && it.queueIndex !== null) return snap.queue[it.queueIndex]
+      if (it.ctxIndex !== undefined && it.ctxIndex !== null && snap.context) return snap.context.tracks[it.ctxIndex]
+      return null
+    }
+    var m = buildMetas(it)
+    if (m.length === 0) return null
+    return m[it.playStart || 0]
+  }
+
+  function flashAction(raw, text) {
+    actionFlash = { raw: raw, text: text }
+    flashTimer.restart()
+  }
+
+  function queueTail() {
+    var it = items[cursorPos]
+    var m = metaForQueueAction()
+    if (!m) return
+    if (queuedIds()[m.id]) { flashAction(it.raw, "already queued"); return }
+    send({ type: "enqueue", items: [m] })
+    flashAction(it.raw, "queued")
+  }
+
+  function queueHead() {
+    var it = items[cursorPos]
+    var m = metaForQueueAction()
+    if (!m) return
+    if (queuedIds()[m.id]) { flashAction(it.raw, "already queued"); return }
+    send({ type: "play_next", item: m })
+    flashAction(it.raw, "play next")
+  }
+
+  function removeQueueItem() {
+    var it = items[cursorPos]
+    if (tab === "queue" && it && it.queueIndex !== undefined && it.queueIndex !== null)
+      send({ type: "remove_from_queue", index: it.queueIndex })
+  }
+
+  function moveQueueItem(delta) {
+    var it = items[cursorPos]
+    if (tab !== "queue" || !it || it.queueIndex === undefined || it.queueIndex === null) return
+    var target = it.queueIndex + delta
+    if (target < 0 || target >= snap.queue.length) return // daemon clamps; don't move the cursor
+    send({ type: "move_queue", index: it.queueIndex, delta: delta })
+    // Keep the moved song under the cursor: pin its stable id so the
+    // item-remap below follows it to the new slot.
+    cursorPos = cursorPos + delta
+    lastRaw = it.raw
+    requestScroll(cursorPos)
+  }
+
+  // Selection feedback: a short accent label on the acted-on row.
+  property var actionFlash: null
+  Timer { id: flashTimer; interval: 1400; onTriggered: root.actionFlash = null }
+
+  function startFilter() {
+    // The queue tab is a live view of daemon state — no filter there.
+    if (tab === "queue") return
+    filtering = true
+    Qt.callLater(function() { filterInput.forceActiveFocus() })
+  }
 
   function commitFilter() {
     var nf = {}
@@ -484,7 +647,11 @@ Panel {
     var it = (items.length > 0 && cursorPos < items.length) ? items[cursorPos] : null
     if (it && it.drillable) h += " · enter open"
     else if (it && it.kind === "track") h += " · enter play"
-    h += " · h out · / filter · [/] tabs" + (root.canFocusPlaying ? " · o playing" : "") + " · space play/pause · n/N next/prev · ,/. seek · q close"
+    if (tab === "queue" && it && it.queueIndex !== undefined)
+      h += " · enter jump · d remove · J/K move"
+    else if (it && it.kind === "track")
+      h += " · q queue · p play next"
+    h += " · h out" + (tab === "queue" ? "" : " · / filter") + " · [/] tabs" + (root.canFocusPlaying ? " · o playing" : "") + " · space play/pause · n/N next/prev · ,/. seek · s shuffle · r repeat · esc close"
     return h
   }
 
@@ -589,7 +756,11 @@ Panel {
         if (t === "N") { root.prevTrack(); event.accepted = true; return }
         if (t === ",") { root.seekBy(-10); event.accepted = true; return }
         if (t === ".") { root.seekBy(10); event.accepted = true; return }
-        if (t === "q") { root.close(); event.accepted = true; return }
+        if (t === "q") { root.queueTail(); event.accepted = true; return }
+        if (t === "p") { root.queueHead(); event.accepted = true; return }
+        if (t === "d") { root.removeQueueItem(); event.accepted = true; return }
+        if (t === "J") { root.moveQueueItem(1); event.accepted = true; return }
+        if (t === "K") { root.moveQueueItem(-1); event.accepted = true; return }
         if (t === "/") { root.startFilter(); event.accepted = true; return }
         if (t === "o") { root.focusPlaying(); event.accepted = true; return }
         if (t === "Q") { root.switchTab("queue"); event.accepted = true; return }
@@ -694,7 +865,10 @@ Panel {
 
       ListView {
         id: list
-        anchors.fill: parent
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        width: parent.width - Style.space(36)
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         model: root.items
@@ -808,15 +982,73 @@ Panel {
           required property var modelData
           required property int index
           width: list.width
-          height: Math.max(rowImg.visible ? rowImg.height : 0, rowCol.implicitHeight) + Style.space(8)
+          // Pinned head gets extra breathing room; rule/section are compact.
+          height: modelData.kind === "head" ? Math.max(rowImg.visible ? rowImg.height : 0, rowCol.implicitHeight) + Style.space(24)
+                : modelData.kind === "sep" ? Style.space(13)
+                : modelData.kind === "section" ? sectionLabel.implicitHeight + Style.space(8)
+                : Math.max(rowImg.visible ? rowImg.height : 0, rowCol.implicitHeight) + Style.space(8)
 
+          // Cursor highlight only on rows the cursor can actually sit on.
           Rectangle {
             anchors.fill: parent
-            color: !root.filtering && index === root.cursorPos ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : "transparent"
+            color: !root.filtering && (modelData.kind === "track" || modelData.drillable) && index === root.cursorPos ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : "transparent"
+          }
+
+          // Horizontal rule between the queue and the context section.
+          Rectangle {
+            visible: modelData.kind === "sep"
+            anchors.verticalCenter: parent.verticalCenter
+            x: Style.space(16)
+            width: parent.width - Style.space(32)
+            height: 1
+            color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.25)
+          }
+
+          // Context section header.
+          Row {
+            visible: modelData.kind === "section"
+            x: Style.space(16)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(8)
+
+            Text {
+              id: sectionLabel
+              textFormat: Text.PlainText
+              text: modelData.title
+              color: Qt.darker(Color.foreground, 1.3)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              elide: Text.ElideRight
+              width: Style.space(540)
+            }
+          }
+
+          // Selection feedback: a short accent label on the acted-on row.
+          Rectangle {
+            visible: root.actionFlash !== null && root.actionFlash.raw === modelData.raw
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(16)
+            anchors.verticalCenter: parent.verticalCenter
+            radius: Style.cornerRadius
+            color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.22)
+            width: flashLabel.implicitWidth + Style.space(12)
+            height: flashLabel.implicitHeight + Style.space(4)
+
+            Text {
+              id: flashLabel
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: root.actionFlash ? root.actionFlash.text : ""
+              color: Color.accent
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
           }
 
           Row {
             id: rowCol
+            visible: modelData.kind !== "sep" && modelData.kind !== "section"
             leftPadding: Style.space(16)
             rightPadding: Style.space(16)
             anchors.verticalCenter: parent.verticalCenter
@@ -843,7 +1075,7 @@ Panel {
 
               Text {
                 textFormat: Text.PlainText
-                text: modelData.title
+                text: modelData.kind === "head" ? "󰐊  " + modelData.title : modelData.title
                 color: modelData.playing ? Color.accent : Color.foreground
                 font.family: Style.font.family
                 font.pixelSize: Style.font.body
@@ -866,12 +1098,45 @@ Panel {
         }
       }
 
+      // Scroll progress (read-only indicator, not draggable). Lives in its
+      // own gutter so it never overlaps rows; progress is derived from the
+      // content's actual laid-out extents rather than estimated sizes.
+      Rectangle {
+        visible: list.contentHeight > list.height + 1
+        x: parent.width - Style.space(20)
+        y: Style.space(6)
+        width: Style.space(4)
+        height: parent.height - Style.space(12)
+        radius: width / 2
+        color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.10)
+
+        Rectangle {
+          width: parent.width
+          radius: width / 2
+          color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.35)
+
+          // Qt6 contentHeight includes the header; originY is its top edge
+          // (negative when a header is mounted). Content spans
+          // [originY, originY + contentHeight], so the scrollable range is
+          // exactly contentHeight - height — no header guesswork.
+          readonly property real progress: {
+            var range = list.contentHeight - list.height
+            if (range <= 0) return 0
+            return Math.max(0, Math.min(1, (list.contentY - list.originY) / range))
+          }
+          readonly property real frac: Math.min(1, list.height / Math.max(1, list.contentHeight))
+          height: Math.max(Style.space(24), parent.height * frac)
+          y: progress * (parent.height - height)
+        }
+      }
+
       Text {
         visible: root.items.length === 0
         anchors.centerIn: parent
         leftPadding: Style.space(16)
         text: {
           if (!root.libraryLoaded && root.tab !== "queue") return "Loading library…"
+          if (root.tab === "queue") return "Queue empty — q queues the selected song, p plays it next"
           return "No matches" + (root.filterText !== "" ? " for \u201C" + root.filterText + "\u201D — esc to clear" : " here")
         }
         color: Qt.darker(Color.foreground, 1.7)

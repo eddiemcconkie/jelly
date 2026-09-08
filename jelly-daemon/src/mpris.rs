@@ -80,7 +80,7 @@ pub fn changed_props(
             Value::from(status_str(new.status).to_string()),
         );
     }
-    if old.current_index != new.current_index || old.queue != new.queue {
+    if old.current != new.current || old.queue != new.queue || old.queue_head != new.queue_head {
         m.insert("Metadata".into(), metadata_value(new));
     }
     if old.volume != new.volume {
@@ -106,7 +106,10 @@ pub fn changed_props(
 
 /// Mirrors the Player::can_play property.
 fn can_play(snap: &PlaybackSnapshot) -> bool {
-    !snap.queue.is_empty() || snap.auth == Some(AuthStatus::Authenticated)
+    snap.current.is_some()
+        || !snap.queue.is_empty()
+        || snap.queue_head.is_some()
+        || snap.auth == Some(AuthStatus::Authenticated)
 }
 
 fn status_str(s: PlaybackStatus) -> &'static str {
@@ -126,15 +129,14 @@ fn loop_str(r: RepeatMode) -> &'static str {
 }
 
 fn current<'a>(snap: &'a PlaybackSnapshot) -> Option<&'a jelly_ipc::TrackMeta> {
-    snap.current_index.and_then(|i| snap.queue.get(i))
+    snap.current.as_ref()
 }
 
 /// a{sv} metadata dict for the current track.
 fn metadata_map(snap: &PlaybackSnapshot) -> HashMap<String, Value<'static>> {
     let mut map = HashMap::new();
     if let Some(track) = current(snap) {
-        let idx = snap.current_index.unwrap_or(0);
-        let track_id = ObjectPath::try_from(format!("{PATH}/Track/{idx}"))
+        let track_id = ObjectPath::try_from(format!("{PATH}/Track/{}", track.id))
             .unwrap_or_else(|_| ObjectPath::from_static_str_unchecked(PATH));
         map.insert("mpris:trackid".to_string(), Value::ObjectPath(track_id));
         map.insert("xesam:title".to_string(), Value::from(track.name.clone()));
