@@ -169,7 +169,10 @@ impl Coordinator {
                 self.apply(t);
             }
             AppCommand::Seek(pos) => {
-                self.position_secs = pos.max(0.0);
+                // Clamp to what the current track reports; a seek past the
+                // end must never push the optimistic position beyond it.
+                let max = self.duration_secs.unwrap_or(f64::MAX);
+                self.position_secs = pos.clamp(0.0, max);
                 self.engine.send(crate::playback::EngineCommand::Seek(self.position_secs));
             }
             AppCommand::SetVolume(v) => {
@@ -351,6 +354,30 @@ impl Coordinator {
 
     async fn login(&mut self) {
         let old = self.build_snapshot();
+        // Session cache first: no rbw round-trip (and no pinentry risk)
+        // when this is a daemon restart within the same login session.
+        if let Some(cached) = crate::rbw::cached_credentials() {
+            match self
+                .client
+                .authenticate(&cached.username, &cached.password)
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!("authenticated as {} (cached credentials)", cached.username);
+                    let _ = self.auth_tx.send(AuthStatus::Authenticated);
+                    match self.client.favorite_ids().await {
+                        Ok(ids) => self.favorite_ids = ids,
+                        Err(e) => tracing::warn!("favorite fetch failed: {e:#}"),
+                    }
+                    self.push_state(&old).await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("cached credentials rejected, falling back to rbw: {e:#}");
+                    crate::rbw::clear_cached_credentials();
+                }
+            }
+        }
         if !crate::rbw::unlocked().await {
             tracing::info!("rbw locked; spawning rbw unlock for a pinentry prompt");
             let _ = self.auth_tx.send(AuthStatus::NeedsUnlock);
@@ -364,6 +391,10 @@ impl Coordinator {
                 Ok(_) => {
                     tracing::info!("authenticated as {username}");
                     let _ = self.auth_tx.send(AuthStatus::Authenticated);
+                    crate::rbw::cache_credentials(&crate::rbw::CachedCredentials {
+                        username: username.clone(),
+                        password,
+                    });
                     // Refresh the favorite set for the heart icons.
                     match self.client.favorite_ids().await {
                         Ok(ids) => self.favorite_ids = ids,

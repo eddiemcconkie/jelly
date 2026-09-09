@@ -561,7 +561,14 @@ Panel {
   function skip(dir) { send(dir > 0 ? { type: "next" } : { type: "prev" }) }
   function nextTrack() { skip(1) }
   function prevTrack() { skip(-1) }
-  function seekBy(d) { send({ type: "seek", position_secs: Math.max(0, position + d) }) }
+  // Seeking clamps at the edges of the current song; the bar fill caps.
+  function seekBy(d) {
+    if (duration > 0) {
+      send({ type: "seek", position_secs: Math.max(0, Math.min(duration - 0.5, position + d)) })
+      return
+    }
+    send({ type: "seek", position_secs: Math.max(0, position + d) })
+  }
 
   // ---- queue actions (q/p work on any track row; d/J/K only on waiting
   //      queue items in the queue tab)
@@ -823,8 +830,8 @@ Panel {
         }
         if (t === "n") { root.nextTrack(); event.accepted = true; return }
         if (t === "N") { root.prevTrack(); event.accepted = true; return }
-        if (t === ",") { root.seekBy(-10); event.accepted = true; return }
-        if (t === ".") { root.seekBy(10); event.accepted = true; return }
+        if (t === "," && !event.isAutoRepeat) { root.seekBy(-10); event.accepted = true; return }
+        if (t === "." && !event.isAutoRepeat) { root.seekBy(10); event.accepted = true; return }
         if (t === "q") { root.queueTail(); event.accepted = true; return }
         if (t === "p") { root.queueHead(); event.accepted = true; return }
         if (t === "d") { root.removeQueueItem(); event.accepted = true; return }
@@ -1360,7 +1367,7 @@ Panel {
               color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.12)
 
               Rectangle {
-                width: Math.round(parent.width * (root.duration > 0 ? root.position / root.duration : 0))
+                width: Math.min(parent.width, Math.round(parent.width * (root.duration > 0 ? root.position / root.duration : 0)))
                 height: parent.height
                 radius: parent.radius
                 color: Color.accent
