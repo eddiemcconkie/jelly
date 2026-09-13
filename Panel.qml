@@ -555,7 +555,70 @@ Panel {
     }
   }
 
-  readonly property bool canFocusPlaying: nowPlayingRaw() !== -1
+
+  // ---- command palette (?): every keybind, filterable. One filter char
+  //      matches keybinds; multiple chars match descriptions.
+  property bool paletteOpen: false
+  property bool paletteFiltering: false
+  property int paletteCursor: 0
+
+  readonly property var commands: [
+    { key: "j", desc: "Move cursor down" },
+    { key: "k", desc: "Move cursor up" },
+    { key: "Enter", desc: "Play selection (album/playlist from start)" },
+    { key: "l", desc: "Into view (drill)" },
+    { key: "h", desc: "Out of view / close" },
+    { key: "Esc", desc: "Clear filter / out of view / close" },
+    { key: "Tab", desc: "Next tab" },
+    { key: "Shift+Tab", desc: "Previous tab" },
+    { key: "H", desc: "Previous tab" },
+    { key: "L", desc: "Next tab" },
+    { key: "g", desc: "Jump to top of list" },
+    { key: "G", desc: "Jump to bottom of list" },
+    { key: "o", desc: "Focus the playing row" },
+    { key: "/", desc: "Filter the current view" },
+    { key: "q", desc: "Queue selection at tail of queue" },
+    { key: "p", desc: "Queue selection to play next (head)" },
+    { key: "d", desc: "Remove selected queue item" },
+    { key: "J", desc: "Move queue item down" },
+    { key: "K", desc: "Move queue item up" },
+    { key: "f", desc: "Toggle favorite on selection" },
+    { key: "F", desc: "Toggle favorite on playing song" },
+    { key: "s", desc: "Toggle shuffle" },
+    { key: "r", desc: "Cycle repeat off / all / one" },
+    { key: "n", desc: "Next track" },
+    { key: "N", desc: "Previous track" },
+    { key: "Space", desc: "Play / pause" },
+    { key: ",", desc: "Seek back 10s" },
+    { key: ".", desc: "Seek forward 10s" },
+    { key: "?", desc: "Command palette" }
+  ]
+
+  readonly property var paletteItems: {
+    var f = paletteFilter.toLowerCase()
+    if (f === "") return commands
+    if (f.length === 1)
+      return commands.filter(function(c) { return c.key.toLowerCase().indexOf(f) >= 0 })
+    return commands.filter(function(c) { return c.desc.toLowerCase().indexOf(f) >= 0 })
+  }
+  onPaletteItemsChanged:
+    paletteCursor = Math.max(0, Math.min(paletteCursor, paletteItems.length - 1))
+
+  property string paletteFilter: ""
+
+  function openPalette() {
+    paletteOpen = true
+    paletteFiltering = false
+    paletteFilter = ""
+    paletteCursor = 0
+    Qt.callLater(function() { paletteModal.forceActiveFocus() })
+  }
+
+  function closePalette() {
+    paletteOpen = false
+    paletteFiltering = false
+    Qt.callLater(function() { if (!filtering) keyFocus.forceActiveFocus() })
+  }
 
   function togglePlay() { send({ type: "toggle_play" }) }
   function skip(dir) { send(dir > 0 ? { type: "next" } : { type: "prev" }) }
@@ -715,22 +778,6 @@ Panel {
     if (had) focusRaw(lastRaw, 0)
   }
 
-  // ---- contextual hint bar
-  readonly property string hints: {
-    if (!connected) return "daemon offline — start jelly-daemon"
-    if (filtering) return "type to filter (live) · enter keep & jump in · esc cancel"
-    var h = "j/k move"
-    var it = (items.length > 0 && cursorPos < items.length) ? items[cursorPos] : null
-    if (it && it.drillable) h += " · enter open"
-    else if (it && it.kind === "track") h += " · enter play"
-    if (tab === "queue" && it && it.queueIndex !== undefined)
-      h += " · enter jump · d remove · J/K move"
-    else if (it && it.kind === "track")
-      h += " · q queue · p play next · f favorite"
-    h += " · h out" + (tab === "queue" ? "" : " · / filter") + " · tab/H/L tabs" + (root.canFocusPlaying ? " · o playing" : "") + " · space play/pause · n/N next/prev · ,/. seek · s shuffle · r repeat · F fav playing · esc close"
-    return h
-  }
-
   function open() { controller.show() }
   function close() { controller.hide() }
   function toggle() { opened ? close() : open() }
@@ -799,6 +846,7 @@ Panel {
       Keys.priority: Keys.BeforeItem
 
       Keys.onPressed: function(event) {
+        if (root.paletteOpen) { event.accepted = true; return }
         var t = event.text
         // No key repeat on transport keys: held n/N would queue a burst of
         // cold network fetches in mpv. j/k and ,/. keep their repeat.
@@ -841,6 +889,7 @@ Panel {
         if (t === "K") { root.moveQueueItem(-1); event.accepted = true; return }
         if (t === "/") { root.startFilter(); event.accepted = true; return }
         if (t === "o") { root.focusPlaying(); event.accepted = true; return }
+        if (t === "?") { root.openPalette(); event.accepted = true; return }
         if (t === "H") { root.cycleTab(-1); event.accepted = true; return }
         if (t === "L") { root.cycleTab(1); event.accepted = true; return }
         if (event.key === Qt.Key_Tab && !event.isAutoRepeat) { root.cycleTab(1); event.accepted = true; return }
@@ -1401,17 +1450,149 @@ Panel {
         }
       }
 
-      // hint bar
-      Text {
-        textFormat: Text.PlainText
-        leftPadding: Style.space(16)
-        rightPadding: Style.space(16)
-        width: parent.width
-        text: root.hints
-        color: Qt.darker(Color.foreground, 1.6)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
+      // command palette: dims the panel and floats a navigable list of
+      // every keybind. "/" switches to filter mode (input focused); Esc
+      // leaves filter mode; Esc/h in navigate mode closes.
+      Rectangle {
+        anchors.fill: parent
+        visible: root.paletteOpen
+        color: Qt.rgba(0, 0, 0, 0.55)
+
+        Rectangle {
+          id: paletteModal
+
+          anchors.centerIn: parent
+          width: parent.width - Style.space(96)
+          height: Style.space(440)
+          radius: Style.cornerRadius
+          color: Color.popups.background
+          border.width: Math.max(1, Style.space(1))
+          border.color: Color.popups.border
+
+          Keys.onPressed: function(event) {
+            var t = event.text
+            if (event.key === Qt.Key_Escape || t === "h") { root.closePalette(); event.accepted = true; return }
+            if (event.key === Qt.Key_Down || t === "j") { root.paletteCursor = Math.min(root.paletteItems.length - 1, root.paletteCursor + 1); event.accepted = true; return }
+            if (event.key === Qt.Key_Up || t === "k") { root.paletteCursor = Math.max(0, root.paletteCursor - 1); event.accepted = true; return }
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.closePalette(); event.accepted = true; return }
+            if (event.key === Qt.Key_PageDown) { root.paletteCursor = Math.min(root.paletteItems.length - 1, root.paletteCursor + 8); event.accepted = true; return }
+            if (event.key === Qt.Key_PageUp) { root.paletteCursor = Math.max(0, root.paletteCursor - 8); event.accepted = true; return }
+            if (t === "/") {
+              root.paletteFiltering = true
+              Qt.callLater(function() { paletteInput.forceActiveFocus() })
+              event.accepted = true
+              return
+            }
+          }
+
+          onFocusChanged: if (!focus && visible && !root.paletteFiltering) forceActiveFocus()
+
+          Column {
+            anchors.fill: parent
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
+
+            // Filter mode input; the dimmed "/" prompt takes its place in
+            // navigate mode, same as the main views.
+            TextField {
+              id: paletteInput
+              visible: root.paletteFiltering
+              width: parent.width
+              height: tabsRow.height
+              placeholderText: "filter commands…"
+              foreground: Color.foreground
+              onVisibleChanged: if (visible) { text = ""; forceActiveFocus() }
+              onTextChanged: root.paletteFilter = text
+              Keys.onPressed: function(event) {
+                // In filter mode: Esc clears the text first, then a second
+                // Esc exits back to navigate mode. Enter commits (and the
+                // cursor restarts at the first match). Focus moves
+                // synchronously so keys can never fall between the two
+                // modes and get swallowed.
+                if (event.key === Qt.Key_Escape) {
+                  root.paletteFiltering = false
+                  root.paletteFilter = ""
+                  paletteModal.forceActiveFocus()
+                  event.accepted = true
+                  return
+                }
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                  // Commit the filter: start at the first match.
+                  root.paletteFiltering = false
+                  root.paletteCursor = 0
+                  paletteModal.forceActiveFocus()
+                  event.accepted = true
+                  return
+                }
+              }
+            }
+
+            Item {
+              visible: !root.paletteFiltering
+              width: parent.width
+              height: tabsRow.height
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(4)
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "/ filter commands"
+                color: Qt.darker(Color.foreground, 1.4)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+              }
+            }
+
+            ListView {
+              width: parent.width
+              height: parent.height - tabsRow.height - Style.space(8)
+              clip: true
+              model: root.paletteItems
+              currentIndex: root.paletteCursor
+              boundsBehavior: Flickable.StopAtBounds
+
+              delegate: Item {
+                required property var modelData
+                required property int index
+                width: ListView.view.width
+                height: commandText.implicitHeight + Style.space(10)
+
+                Rectangle {
+                  anchors.fill: parent
+                  color: !root.paletteFiltering && index === root.paletteCursor ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : "transparent"
+                }
+
+                Row {
+                  x: Style.space(12)
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(14)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.key
+                    color: Color.accent
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    width: Style.space(96)
+                  }
+
+                  Text {
+                    id: commandText
+                    textFormat: Text.PlainText
+                    text: modelData.desc
+                    color: Color.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                    width: Style.space(400)
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     }
   }
