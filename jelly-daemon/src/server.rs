@@ -98,13 +98,28 @@ async fn serve_conn(
     let mut lines = FramedRead::new(reader, LinesCodec::new());
     let mut sink = FramedWrite::new(writer, LinesCodec::new());
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<DaemonMessage>();
-    // Reply channel for an in-flight browse request, if any.
-    let mut browse_reply: Option<oneshot::Receiver<DaemonMessage>> = None;
+    // In-flight browse requests, in order. A client may have several
+    // outstanding (e.g. artists and playlists at once); each reply is
+    // picked up in the order the requests were made.
+    let mut browse_replies: std::collections::VecDeque<oneshot::Receiver<DaemonMessage>> =
+        std::collections::VecDeque::new();
 
     tracing::debug!(id, "client connected");
 
+    // Heartbeat: the client's watchdog infers a dead daemon from socket
+    // silence, but an idle (paused) daemon is legitimately silent —
+    // without this the client reconnects every few seconds.
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(2));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                if sink.send(serde_json::to_string(
+                    &DaemonMessage::new(DaemonKind::Pong, None)).unwrap_or_default()).await.is_err() {
+                    break;
+                }
+            }
             line = lines.next() => {
                 let Some(line) = line else { break };
                 match line {
@@ -115,7 +130,7 @@ async fn serve_conn(
                             if is_browse(&msg.kind) {
                                 let (tx, rx) = oneshot::channel();
                                 let _ = browse_tx.send(BrowseRequest { msg, reply: tx });
-                                browse_reply = Some(rx);
+                                browse_replies.push_back(rx);
                             } else {
                                 for r in handle_client_msg(msg, &cmd_tx, &state_rx, &auth_rx) {
                                     let _ = reply_tx.send(r);
@@ -146,12 +161,12 @@ async fn serve_conn(
                 }
             }
             reply = async {
-                match browse_reply.as_mut() {
+                match browse_replies.front_mut() {
                     Some(rx) => rx.await.ok(),
                     None => std::future::pending().await,
                 }
             } => {
-                browse_reply = None;
+                browse_replies.pop_front();
                 if let Some(reply) = reply {
                     if sink.send(serde_json::to_string(&reply).unwrap_or_default()).await.is_err() {
                         break;

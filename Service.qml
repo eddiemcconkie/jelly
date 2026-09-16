@@ -1,4 +1,4 @@
-// PROTOTYPE — headless service: keeps the jelly daemon alive with the shell.
+// Headless service: keeps the jelly daemon alive with the shell.
 // While debugging, Eddie shouldn't have to think about the daemon running.
 // On shell start (and plugin reload): spawn the daemon unless one is already
 // alive; if it dies, bring it back after a short cooldown. Its stdout/stderr
@@ -15,9 +15,89 @@ import Quickshell.Io
 Item {
   id: root
 
+  property var shell: null
+
   readonly property string pluginDir: Quickshell.env("JELLY_PLUGIN_DIR")
     || (Quickshell.env("HOME") + "/.config/omarchy/plugins/eddie.jelly")
   readonly property string bin: pluginDir + "/target/debug/jelly-daemon"
+  readonly property var sharedPanel: panelLoader.item
+
+  function configurePanel(widget, anchor) {
+    var panel = sharedPanel
+    if (!panel || !widget || !anchor) return null
+    if ("bar" in panel) panel.bar = widget.bar
+    if ("settings" in panel) panel.settings = widget.settings
+    if ("anchorItem" in panel) panel.anchorItem = anchor
+    if ("hostWidget" in panel) panel.hostWidget = widget
+    return panel && panel.hostWidget ? panel : null
+  }
+
+  function openFrom(widget, anchor) {
+    var panel = configurePanel(widget, anchor)
+    if (panel) panel.open()
+  }
+
+  function closeFrom(widget) {
+    var panel = sharedPanel
+    if (!panel) return
+    if (!widget || panel.hostWidget === widget) panel.close()
+  }
+
+  function toggleFrom(widget, anchor) {
+    var panel = sharedPanel
+    if (panel && panel.opened && panel.hostWidget === widget) {
+      panel.close()
+      return
+    }
+    openFrom(widget, anchor)
+  }
+
+  function panelForScreen(screenName) {
+    var panel = sharedPanel
+    var widgets = []
+    if (shell && shell.bar && typeof shell.bar.moduleWidgets === "function")
+      widgets = shell.bar.moduleWidgets("eddie.jelly")
+    for (var i = 0; i < widgets.length; i++) {
+      var widget = widgets[i]
+      var anchor = widget && widget.anchorButton ? widget.anchorButton : null
+      var window = anchor && anchor.QsWindow ? anchor.QsWindow.window : null
+      if (window && window.screen && window.screen.name === screenName)
+        return configurePanel(widget, anchor)
+    }
+    return panel
+  }
+
+  function debugKeyOnScreen(screenName, name) {
+    var panel = panelForScreen(screenName)
+    if (panel) panel.injectKey(name)
+  }
+
+  IpcHandler {
+    target: "eddie.jelly"
+
+    function open(): void {
+      var panel = root.panelForScreen("eDP-1")
+      if (panel) panel.open()
+    }
+    function close(): void { root.closeFrom(null) }
+    function toggle(): void {
+      var panel = root.panelForScreen("eDP-1")
+      if (!panel) return
+      if (panel.opened) panel.close()
+      else panel.open()
+    }
+    function debugKey(name: string): string {
+      root.debugKeyOnScreen("eDP-1", name)
+      return "ok"
+    }
+  }
+
+  Loader {
+    id: panelLoader
+    active: true
+    source: Qt.resolvedUrl("Panel.qml")
+    visible: false
+  }
 
   Process {
     id: daemonProc
@@ -43,7 +123,9 @@ Item {
   Process {
     id: checkProc
     command: ["/usr/bin/pgrep", "-f", "target/debug/[j]elly-daemon"]
-    onExited: if (exitCode !== 0 && !daemonProc.running) daemonProc.running = true
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && !daemonProc.running) daemonProc.running = true
+    }
   }
 
   Timer {

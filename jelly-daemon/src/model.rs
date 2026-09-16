@@ -210,18 +210,29 @@ impl PlaybackModel {
         self.next()
     }
 
-    /// Toggle shuffle: a fixed permutation of the context order only.
-    /// The current track keeps playing — `pos` is remapped to wherever it
-    /// sits in the new order.
+    /// Toggle shuffle. Turning it on means "play every song shuffled,
+    /// starting with the current one": the playing track becomes the
+    /// first element of the new order, the rest is a shuffled permutation
+    /// after it, and playback resumes at position 0. With repeat off the
+    /// list ends once every song has played; with repeat-all the list
+    /// wraps back to that same start position. Turning shuffle off
+    /// restores the original order, keeping the playing track current.
     pub fn set_shuffle(&mut self, on: bool) {
         self.shuffle = on;
         let Some(ctx) = self.context.as_mut() else { return };
         if on {
             let playing_track_idx = ctx.pos.and_then(|p| ctx.order.get(p).copied());
-            ctx.order = shuffle_order(ctx.tracks.len(), &[0xBA, 0xDC, 0x0F, 0xEE, 0xBA, 0xBE]);
-            // Keep the current track current.
-            if let Some(t) = playing_track_idx {
-                ctx.pos = Some(ctx.order.iter().position(|&i| i == t).unwrap_or(0));
+            let perm = shuffle_order(ctx.tracks.len(), shuffle_seed());
+            let ppos = match playing_track_idx {
+                Some(t) => perm.iter().position(|&i| i == t).unwrap_or(0),
+                None => 0,
+            };
+            let mut order: Vec<usize> = perm[ppos..].to_vec();
+            order.extend_from_slice(&perm[..ppos]);
+            ctx.order = order;
+            // The playing track is now the shuffle's first song.
+            if ctx.pos.is_some() {
+                ctx.pos = Some(0);
             }
         } else {
             let playing_track_idx = ctx.pos.and_then(|p| ctx.order.get(p).copied());
@@ -299,15 +310,20 @@ fn c_track(m: &PlaybackModel, pos: usize) -> Option<&TrackMeta> {
     m.context.as_ref().and_then(|c| c.track_at(pos))
 }
 
-/// Deterministic Fisher-Yates over `n` items from a fixed seed — keeps the
-/// permutation stable per toggle and unit-testable. Swap in a real RNG
-/// source at the call site if this ever matters.
-fn shuffle_order(n: usize, seed: &[u8]) -> Vec<usize> {
+/// A fresh seed per shuffle toggle, so every shuffle-on is a new order.
+fn shuffle_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ (u64::from(std::process::id()) << 32) ^ 0x9E37_79B9_7F4A_7C15
+}
+
+/// Fisher-Yates over `n` items from the given seed.
+fn shuffle_order(n: usize, seed: u64) -> Vec<usize> {
     let mut order: Vec<usize> = (0..n).collect();
-    // xorshift-ish from the seed bytes.
-    let mut s = seed.iter().fold(0x2545F4914F6CDD1Du64, |acc, b| {
-        (acc ^ u64::from(*b)).wrapping_mul(0x100000001B3)
-    });
+    let mut s = seed;
     if n > 1 {
         for i in (1..n).rev() {
             s ^= s << 13;
@@ -445,8 +461,10 @@ mod tests {
         let mut sorted = c.order.clone();
         sorted.sort();
         assert_eq!(sorted, (0..7).collect::<Vec<_>>());
-        // The current track (start index 2 → third track) stays current.
-        assert_eq!(c.track_at(c.pos.unwrap()).map(|t| t.id.as_str()), Some("3"));
+        // "Play every song shuffled, starting with the current one": the
+        // playing track is the FIRST song of the new order.
+        assert_eq!(c.pos, Some(0));
+        assert_eq!(c.track_at(0).map(|t| t.id.as_str()), Some("3"));
         m.set_shuffle(false);
         let c = m.context.as_ref().unwrap();
         assert_eq!(c.order, (0..7).collect::<Vec<_>>());
@@ -454,18 +472,22 @@ mod tests {
     }
 
     #[test]
-    fn shuffle_continuation_walks_new_order() {
-        let (mut m, _) = model(&["1", "2", "3"], 0);
+    fn shuffle_repeat_wraps_to_shuffled_start() {
+        // Repeat-all wraps the shuffled list back to its first song —
+        // the track that was playing when shuffle was enabled.
+        let (mut m, _) = model(&["1", "2", "3", "4"], 2);
         m.set_shuffle(true);
         m.repeat = RepeatMode::All;
         let mut seen = vec![];
-        for _ in 0..3 {
+        for _ in 0..5 {
             if let Transition::Play(t) = m.next() {
                 seen.push(t.id);
             }
         }
-        seen.sort();
-        assert_eq!(seen, vec!["1", "2", "3"]);
+        // next() 1..=3 walk positions 1..3; the 4th advances past the end
+        // and wraps to position 0 — the song that started the shuffle.
+        assert_eq!(seen[3], "3");
+        assert_eq!(seen[0..3].iter().any(|s| s == "3"), false);
     }
 
     #[test]

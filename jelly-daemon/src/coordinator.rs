@@ -41,6 +41,21 @@ pub enum AppCommand {
     Login,
 }
 
+/// Short label for command logging (no payload noise).
+fn cmd_title(cmd: &AppCommand) -> String {
+    match cmd {
+        AppCommand::Play { start_index, .. } => format!("Play@{start_index}"),
+        AppCommand::JumpTo { index, .. } => format!("JumpTo@{index}"),
+        AppCommand::RemoveFromQueue { index, .. } => format!("Remove@{index}"),
+        AppCommand::MoveQueue { index, delta, .. } => format!("Move@{index} {delta:+}"),
+        AppCommand::ToggleFavorite { item_id, .. } => format!("Fav {item_id}"),
+        AppCommand::Enqueue { items, .. } => format!("Enqueue n={}", items.len()),
+        AppCommand::SetShuffle(on) => format!("Shuffle {on}"),
+        AppCommand::SetRepeat(r) => format!("Repeat {r:?}"),
+        other => format!("{other:?}"),
+    }
+}
+
 /// State machine glue between the socket/MPRIS front doors, the Jellyfin
 /// client, the mpv engine, and the shared snapshot.
 pub struct Coordinator {
@@ -133,6 +148,7 @@ impl Coordinator {
     }
 
     pub async fn handle_cmd(&mut self, cmd: AppCommand) {
+        tracing::info!("cmd: {:?}", cmd_title(&cmd));
         let old = self.build_snapshot();
         match cmd {
             AppCommand::Login => self.login().await,

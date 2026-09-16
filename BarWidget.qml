@@ -1,9 +1,8 @@
-// PROTOTYPE — bar pill for the Jelly interaction-design prototype.
+// Bar pill for the Jelly widget.
 // Long "title — album" strings marquee: clipped at a max width, scroll left
 // and back while overflowing; static once it fits.
 import QtQuick
 import Quickshell
-import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
@@ -11,9 +10,12 @@ BarWidget {
   id: root
   moduleName: "eddie.jelly"
 
-  readonly property bool live: panelLoader.item !== null
-  readonly property string label: live ? panelLoader.item.pillText : "Jelly"
-  readonly property string playGlyph: live ? panelLoader.item.pillGlyph : "󰐊"
+  readonly property var jellyService: bar?.shell?.serviceFor("eddie.jelly")
+  readonly property var panel: jellyService ? jellyService.sharedPanel : null
+  readonly property var anchorButton: button
+  readonly property bool live: panel !== null
+  readonly property string label: live ? panel.pillText : "Jelly"
+  readonly property string playGlyph: live ? panel.pillGlyph : "󰐊"
 
   // Marquee geometry: max pill width and the measured text width. Only in
   // horizontal mode; the vertical bar keeps a static label.
@@ -21,14 +23,14 @@ BarWidget {
   readonly property real pillMaxWidth: Style.space(280)
   readonly property real pillPadding: Style.spaceReal(8.75) * 2
   readonly property real textWidth: metrics.width
-  readonly property bool coverVisible: live && panelLoader.item.nowCover !== ""
+  readonly property bool coverVisible: live && panel.nowCover !== ""
   readonly property real coverWidth: coverVisible ? Style.space(20 + 6) : 0
   readonly property real availableWidth: Math.max(0, pillMaxWidth - pillPadding - coverWidth)
   readonly property bool overflowing: horizontal && textWidth > availableWidth
   readonly property real pillWidth: horizontal
     ? (overflowing ? pillMaxWidth : textWidth + pillPadding + coverWidth) : -1
 
-  readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
+  readonly property bool opened: panel ? panel.opened === true && panel.hostWidget === root : false
 
   TextMetrics {
     id: metrics
@@ -44,43 +46,12 @@ BarWidget {
     if (root.overflowing) marqueeAnim.restart()
   }
 
-  function open() { if (panelLoader.item) panelLoader.item.open() }
-  function close() { if (panelLoader.item) panelLoader.item.close() }
-  function togglePanel() { if (panelLoader.item) panelLoader.item.toggle() }
-
-  function injectPanel() {
-    var target = panelLoader.item
-    if (!target) return
-    if ("bar" in target) target.bar = root.bar
-    if ("settings" in target) target.settings = root.settings
-    if ("anchorItem" in target) target.anchorItem = button
-    if ("hostWidget" in target) target.hostWidget = root
-  }
+  function open() { if (jellyService) jellyService.openFrom(root, button) }
+  function close() { if (jellyService) jellyService.closeFrom(root) }
+  function togglePanel() { if (jellyService) jellyService.toggleFrom(root, button) }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
-
-  onBarChanged: injectPanel()
-  onSettingsChanged: injectPanel()
-
-  Loader {
-    id: panelLoader
-    active: true
-    source: Qt.resolvedUrl("Panel.qml")
-    visible: false
-    onLoaded: {
-      root.injectPanel()
-      Qt.callLater(root.injectPanel)
-    }
-  }
-
-  IpcHandler {
-    target: "eddie.jelly"
-
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function toggle(): void { root.togglePanel() }
-  }
 
   WidgetButton {
     id: button
@@ -106,7 +77,7 @@ BarWidget {
 
       Image {
         visible: root.coverVisible
-        source: root.live ? panelLoader.item.nowCover : ""
+        source: root.live ? root.panel.nowCover : ""
         anchors.verticalCenter: parent.verticalCenter
         width: Style.space(20)
         height: Style.space(20)

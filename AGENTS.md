@@ -15,6 +15,12 @@
   `/usr/lib/qt6/bin/qmllint <file>.qml` (ignore qs.Commons import warnings —
   they only appear because qmllint runs outside the shell). Runtime QML errors
   show up in `journalctl --user`.
+- **Implicit layouts by default.** Compose with Row/Column (or RowLayout/
+  ColumnLayout where fill/alignment is needed) plus `spacing` and padding;
+  let items derive their own `implicitHeight` from their content. Do not
+  hardcode row/item heights or hand-place children with `x`/`y`/anchors
+  unless there is no layout alternative. Fixed sizes are for media (cover
+  art and the like) so surrounding content adapts when those change.
 
 ## Daemon
 - The daemon's lifecycle belongs to the plugin: `Service.qml` spawns
@@ -30,6 +36,18 @@
   unlocked for auth (or the unlock prompt handles it).
 
 ## Testing / fixtures
+- **Headless UI testing (no manual keyboard):** the widget accepts IPC from
+  `omarchy-shell eddie.jelly <cmd>`:
+  - `toggle` / `open` / `close` — the popup panel
+  - `debugKey <name>` — inject a synthetic key through the same router as the
+    real keyboard (`Panel.qml` `injectKey`). Names: `Enter`, `Return`,
+    `Escape`, `Up`, `Down`, `Left`, `Right`, `Space`, or any single char
+    (`j`, `k`, `q`, `f`, `Tab` uses `Enter`-style names only — see the map).
+  Typical debug loop:
+  `omarchy restart shell; sleep 5; omarchy-shell eddie.jelly toggle;
+  omarchy-shell eddie.jelly debugKey j;`
+  then verify behavior in `journalctl --user -f` (grep `qml: jelly`:` — the
+  panel logs state pushes, activations, sends; List logs cursor moves).
 - `target/debug/jctl` — poke the socket (state, play <id>, toggle, next...).
 - `cargo run --bin probe` regenerates `MockLibrary.json` (real library dump:
   albums/tracks/covers/playlists incl. nested ones). It is gitignored.
