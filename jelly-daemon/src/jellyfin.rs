@@ -253,6 +253,24 @@ impl JellyfinClient {
         Ok(resp.items)
     }
 
+    /// Every album in the library: one request, no artist bridge.
+    pub async fn all_albums(&self) -> Result<Vec<MediaItem>> {
+        let user_id = self.user_id.as_deref().context("not authenticated")?;
+        let resp: ItemsResponse = self
+            .get_json(
+                "/Items",
+                &[
+                    ("userId", user_id),
+                    ("includeItemTypes", "MusicAlbum"),
+                    ("recursive", "true"),
+                    ("sortBy", "SortName"),
+                    ("fields", "ImageTags,ChildCount"),
+                ],
+            )
+            .await?;
+        Ok(resp.items)
+    }
+
     pub async fn albums_for_artist(&self, artist_id: &str) -> Result<Vec<MediaItem>> {
         let user_id = self.user_id.as_deref().context("not authenticated")?;
         let resp: ItemsResponse = self

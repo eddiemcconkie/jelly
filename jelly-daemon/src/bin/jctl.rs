@@ -88,13 +88,7 @@ fn build_message(args: &[String]) -> (ClientKind, Option<u64>) {
             },
             req_id,
         ),
-        Some("artists") => (K::BrowseArtists, req_id),
-        Some("albums") => (
-            K::BrowseAlbums {
-                artist_id: args.get(1).cloned().unwrap_or_default(),
-            },
-            req_id,
-        ),
+        Some("albums") => (K::BrowseAlbums, req_id),
         Some("tracks") => (
             K::BrowseTracks {
                 album_id: args.get(1).cloned().unwrap_or_default(),

@@ -194,8 +194,7 @@ async fn serve_conn(
 fn is_browse(kind: &ClientKind) -> bool {
     matches!(
         kind,
-        ClientKind::BrowseArtists
-            | ClientKind::BrowseAlbums { .. }
+        ClientKind::BrowseAlbums
             | ClientKind::BrowseTracks { .. }
             | ClientKind::BrowsePlaylists
             | ClientKind::BrowsePlaylistTracks { .. }
@@ -236,6 +235,10 @@ fn handle_client_msg(
         }
         ClientKind::Play { tracks, start_index } => {
             let _ = cmd_tx.send(AppCommand::Play { tracks, start_index });
+            vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
+        }
+        ClientKind::PlayAlbum { album_id } => {
+            let _ = cmd_tx.send(AppCommand::PlayAlbum { album_id });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::Pause => {

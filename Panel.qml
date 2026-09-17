@@ -75,8 +75,9 @@ Panel {
   // req_id -> request descriptor, so browse replies can be routed.
   property var pending: ({})
   property int reqSeq: 1
-  property int awaitingArtists: 0
-  property int awaitingAlbums: 0
+  // Track-list drills already answered (album id -> tracks), so a drill
+  // back and forth never refetches.
+  property var tracksLoaded: ({})
   // One fetch at a time: reconnects must not cancel in-flight requests
   // (the socket churns; each refresh used to wipe `pending` mid-flight).
   property bool libraryFetching: false
@@ -98,10 +99,9 @@ Panel {
     libraryFetching = true
     albumList = []
     playlistList = []
-    awaitingArtists = 0
-    awaitingAlbums = 0
+    tracksLoaded = {}
     pending = ({})
-    browse("browse_artists", {})
+    browse("browse_albums", {})
     browse("browse_playlists", {})
   }
 
@@ -109,30 +109,20 @@ Panel {
     var req = pending[msg.req_id]
     if (!req) return
     var items = msg.items || []
-    if (req.kind === "browse_artists") {
-      delete pending[msg.req_id]
-      awaitingArtists = items.length
-      if (items.length === 0) { awaitingAlbums = 0; return }
-      for (var i = 0; i < items.length; i++) browse("browse_albums", { artist_id: items[i].id })
-    } else if (req.kind === "browse_albums") {
-      delete pending[msg.req_id]
-      var acc = albumList.slice()
-      for (var j = 0; j < items.length; j++) {
-        var it = items[j]
-        acc.push({ id: it.id, title: it.name, artist: it.detail || "", cover: it.image_url || "", tracks: [] })
-      }
+    delete pending[msg.req_id]
+    if (req.kind === "browse_albums") {
+      var acc = items.map(function(x) {
+        return { id: x.id, title: x.name, artist: x.detail || "", cover: x.image_url || "", tracks: [] }
+      })
+      // The server's SortName is franchise-edited on this server; sort by
+      // plain album title here so the overview is alphabetical regardless.
       acc.sort(function(a, b) { return a.title.toLowerCase() < b.title.toLowerCase() ? -1 : 1 })
       albumList = acc
-      awaitingArtists = Math.max(0, awaitingArtists - 1)
-      if (awaitingArtists === 0) {
-        awaitingAlbums = acc.length
-        warmCovers()
-        // Background: fill in each album's tracks for counts + drills.
-        for (var k = 0; k < acc.length; k++) browse("browse_tracks", { album_id: acc[k].id })
-      }
+      libraryFetching = false
+      warmCovers()
     } else if (req.kind === "browse_tracks") {
-      delete pending[msg.req_id]
       var albumId = req.extra.album_id
+      tracksLoaded[albumId] = true
       var next = albumList.slice()
       for (var m = 0; m < next.length; m++) {
         if (next[m].id !== albumId) continue
@@ -146,8 +136,6 @@ Panel {
         break
       }
       albumList = next
-      awaitingAlbums = Math.max(0, awaitingAlbums - 1)
-      if (awaitingArtists === 0 && awaitingAlbums === 0) libraryFetching = false
     } else if (req.kind === "browse_playlists") {
       delete pending[msg.req_id]
       playlistList = items.map(function(x) {
@@ -422,7 +410,7 @@ Panel {
       if (openAlbumId === "") {
         return albumList.map(function(al) {
           return { raw: al.id, albumId: al.id, isAlbum: true, title: al.title,
-                   sub: (al.artist || "") + "  ·  " + (al.tracks || []).length + " tracks",
+                   sub: (al.artist || ""),
                    cover: coverFor(al), showCover: true, showGlyph: true,
                    playing: nowCtx && nowCtx.name === al.title,
                    section: "" }
@@ -431,6 +419,9 @@ Panel {
       var al = null
       for (var k = 0; k < albumList.length; k++) if (albumList[k].id === openAlbumId) al = albumList[k]
       if (!al) return []
+      // Lazy drill: one tracks fetch on first entry, cached in tracksLoaded.
+      if (!(al.tracks || []).length && !tracksLoaded[al.id] && connected)
+        browse("browse_tracks", { album_id: al.id })
       return (al.tracks || []).map(function(t, idx) {
         return { raw: t.id, trackId: t.id, title: t.title, artist: t.artist || "",
                  durationSecs: t.length || null,
@@ -455,10 +446,9 @@ Panel {
     if (tab === "albums") {
       if (item.isAlbum) {
         // Enter plays the album from the start (the daemon's shuffle
-        // order applies from there); l opens it.
-        var al = null
-        for (var i = 0; i < albumList.length; i++) if (albumList[i].id === item.albumId) al = albumList[i]
-        if (al) startPlayback(albumMetas(al), 0)
+        // order applies from there); l opens it. The daemon fetches the
+        // album's track list itself: the widget never needs it for this.
+        send({ type: "play_album", album_id: item.albumId })
         return
       }
       if (item.metas) {
@@ -605,8 +595,6 @@ Panel {
     { key: "l", desc: "Into view (drill)" },
     { key: "h", desc: "Out of view / close" },
     { key: "Esc", desc: "Clear filter / out of view / close" },
-    { key: "Tab", desc: "Next tab" },
-    { key: "Shift+Tab", desc: "Previous tab" },
     { key: "H", desc: "Previous tab" },
     { key: "L", desc: "Next tab" },
     { key: "g", desc: "Jump to top of list" },
@@ -809,9 +797,6 @@ Panel {
         if (t === "?") { root.openPalette(); event.accepted = true; return }
         if (t === "H") { root.cycleTab(-1); event.accepted = true; return }
         if (t === "L") { root.cycleTab(1); event.accepted = true; return }
-        if (event.key === Qt.Key_Tab && !event.isAutoRepeat) { root.cycleTab(1); event.accepted = true; return }
-        // Shift+Tab arrives as Backtab, not Tab+Shift.
-        if (event.key === Qt.Key_Backtab && !event.isAutoRepeat) { root.cycleTab(-1); event.accepted = true; return }
     }
 
     Column {
@@ -1067,7 +1052,11 @@ Panel {
         suppressRemap: root.libraryFetching
         emptyText: root.tab === "queue"
           ? "Queue empty — q queues the selected song, p plays it next"
-          : (root.tab === "albums" && albumList.length === 0 ? "Loading library…" : "Nothing here")
+          : (root.tab === "albums" && albumList.length === 0
+             ? "Loading library…"
+             : (root.tab === "albums" && root.openAlbumId !== "" && !tracksLoaded[root.openAlbumId]
+                ? "Loading…"
+                : "Nothing here"))
         focusPlayingHook: function() { root.focusPlayingRow() }
         backHook: function() { return root.drillBack() }
         drillHook: function() {

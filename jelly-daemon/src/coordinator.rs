@@ -4,6 +4,7 @@
 //! transition is decided here and driven into the engine (which plays one
 //! track at a time). The watch-shared snapshot is derived from the model.
 
+use anyhow::Context as _;
 use crate::server::BrowseRequest;
 use jelly_ipc::{ClientMessage};
 use jelly_ipc::{ClientKind, ErrorCode, PlaybackSnapshot, PlaybackStatus, RepeatMode, TrackMeta};
@@ -14,6 +15,8 @@ pub enum AppCommand {
     /// Replace the playback context and start playing at `start_index`.
     /// The queue survives.
     Play { tracks: Vec<TrackMeta>, start_index: usize },
+    /// Play an album by id: the daemon fetches its tracks and starts at 0.
+    PlayAlbum { album_id: String },
     Pause,
     Resume,
     Toggle,
@@ -45,6 +48,7 @@ pub enum AppCommand {
 fn cmd_title(cmd: &AppCommand) -> String {
     match cmd {
         AppCommand::Play { start_index, .. } => format!("Play@{start_index}"),
+        AppCommand::PlayAlbum { album_id } => format!("PlayAlbum {album_id}"),
         AppCommand::JumpTo { index, .. } => format!("JumpTo@{index}"),
         AppCommand::RemoveFromQueue { index, .. } => format!("Remove@{index}"),
         AppCommand::MoveQueue { index, delta, .. } => format!("Move@{index} {delta:+}"),
@@ -162,6 +166,9 @@ impl Coordinator {
                 let image = tracks[0].image_url.clone();
                 let t = self.model.set_context(name, artist, image, tracks, start_index);
                 self.apply(t);
+            }
+            AppCommand::PlayAlbum { album_id } => {
+                self.play_album_and_apply(&album_id).await;
             }
             AppCommand::Pause => {
                 self.engine.send(crate::playback::EngineCommand::Pause);
@@ -308,6 +315,62 @@ impl Coordinator {
         }
     }
 
+    /// Fetch one item's media metadata.
+    async fn fetch_item(&self, id: &str) -> anyhow::Result<crate::jellyfin::MediaItem> {
+        let user_id = self.client.user_id().context("not authenticated")?;
+        self.client.get_json(&format!("/Users/{user_id}/Items/{id}"), &[]).await
+    }
+
+    /// Play an album by id without the client having its track list:
+    /// fetch the album item (for context name/cover) and its tracks, then
+    /// hand them to the normal Play path.
+    async fn play_album_and_apply(&mut self, album_id: &str) {
+        if !self.client.is_authenticated() {
+            tracing::warn!("play_album before authentication; send login first");
+            return;
+        }
+        let album = match self.fetch_item(album_id).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("play_album: album fetch failed: {e:#}");
+                return;
+            }
+        };
+        let items = match self.client.tracks_for_album(album_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("play_album: track fetch failed: {e:#}");
+                return;
+            }
+        };
+        let tracks: Vec<TrackMeta> = items
+            .iter()
+            .map(|it| TrackMeta {
+                id: it.id.clone(),
+                name: it.name.clone(),
+                artist: it.album_artist.clone().or_else(||
+                    it.artists.as_ref().and_then(|a| a.first().cloned())
+                ).unwrap_or_default(),
+                album: album.name.clone(),
+                duration_secs: it.run_time_ticks.map(|t| t as f64 / 10_000_000.0),
+                image_url: self.client.image_url(&album),
+                stream_url: String::new(),
+            })
+            .collect();
+        if tracks.is_empty() {
+            tracing::warn!("play_album: album {album_id} returned no tracks");
+            return;
+        }
+        let mut tracks = tracks;
+        self.rebuild_stream_urls(&mut tracks);
+        let name = album.name.clone();
+        let artist = tracks[0].artist.clone();
+        let t = self
+            .model
+            .set_context(name, artist, self.client.image_url(&album), tracks, 0);
+        self.apply(t);
+    }
+
     /// Answer a browse request routed from the socket server. Replies are
     /// per-connection (oneshot), never broadcast.
     pub async fn handle_browse(&mut self, req: BrowseRequest) {
@@ -323,8 +386,7 @@ impl Coordinator {
             return;
         }
         let fetched: anyhow::Result<Vec<crate::jellyfin::MediaItem>> = match kind {
-            ClientKind::BrowseArtists => self.client.album_artists().await,
-            ClientKind::BrowseAlbums { artist_id } => self.client.albums_for_artist(&artist_id).await,
+        ClientKind::BrowseAlbums => self.client.all_albums().await,
             ClientKind::BrowseTracks { album_id } => self.client.tracks_for_album(&album_id).await,
             ClientKind::BrowsePlaylists => self.client.playlists().await,
             ClientKind::BrowsePlaylistTracks { playlist_id } => {

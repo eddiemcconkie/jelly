@@ -41,6 +41,9 @@ pub enum ClientKind {
         #[serde(default)]
         start_index: usize,
     },
+    /// Play an album without the client needing its track list: the daemon
+    /// fetches the album's tracks itself and starts at track 0.
+    PlayAlbum { album_id: String },
     Pause,
     Resume,
     TogglePlay,
@@ -59,10 +62,8 @@ pub enum ClientKind {
     /// Full snapshot of playback + context + queue.
     GetState,
     // --- Browse (typed views, lazy fetch; no pagination in v1) ---
-    /// Album artists — the top of the browse tree.
-    BrowseArtists,
-    /// Albums under an artist.
-    BrowseAlbums { artist_id: String },
+    /// One request: every album in the library.
+    BrowseAlbums,
     /// Tracks on an album.
     BrowseTracks { album_id: String },
     /// The user's playlists.

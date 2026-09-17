@@ -1,5 +1,11 @@
 # Operating rules for this repo (jelly-daemon + eddie.jelly plugin)
 
+## Architectural decisions — consult Eddie first
+- **Eddie must be consulted before ANY architectural decision** (component
+  structure, ownership of state, replacing a library primitive like
+  ListView, IPC schema changes, anything that's a refactor rather than a
+  bugfix). Propose options, wait for approval, then act. Do not assume.
+
 ## Project management
 - All project management lives in **Plane** (via the Plane MCP): the Wayfinder
   map issue, tickets, decisions, specs, and research notes. Do NOT keep

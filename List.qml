@@ -24,6 +24,7 @@ Item {
   required property real rowHeight
   property real secHeight: rowHeight
   property var rowHeightOf: function(md) {
+    if (md && md.headerRow) return headerHeight
     return md && md.sectionRow ? secHeight : rowHeight
   }
 
@@ -34,15 +35,8 @@ Item {
   // positionViewAtIndex/AtEnd and no reading of contentHeight.
   function rowH(i) { return rowHeightOf(items[i]) }
 
-  function exactContentHeight() {
-    var h = headerHeight
-    for (var i = 0; i < items.length; i++) h += rowH(i)
-    return h
-  }
-
-  // Row offsets do NOT include the header: delegates start at content
-  // y=0 and the header hangs ABOVE row 0 (contentTop is negative). The
-  // header only enters the total through contentTop (= bounds).
+  // Row offsets are pure model sums: row 0 starts at content y=0, every
+  // delegate (header pseudo-row included) carries a data-driven height.
   function cumulativeY(pos) {
     var h = 0
     for (var i = 0; i < pos; i++) h += rowHeightOf(items[i])
@@ -81,32 +75,34 @@ Item {
     return composeItems(rows.filter(function(it) { return filterFn(it, f) }), false)
   }
 
-  // Section headers become ordinary rows: one delegate geometry, so
-  // contentHeight is exact from the first layout pass (native ListView
-  // section delegates do not participate reliably, which corrupted every
-  // position computed from contentHeight). A header is inserted wherever
-  // consecutive rows change `section`; empty section values merge into
-  // the previous group. A header adopts the height class of the row that
-  // follows it — heights stay uniform within each stretch of the list,
-  // which is what keeps ListView's geometry bookkeeping exact (mixed
-  // heights at the first row corrupted originY/scroll positions).
-  // Sections are skipped while filtering.
+  // The content model is: your rows + synthetic rows with data-driven
+  // heights. Any leading block (album metadata, queue strip) becomes a
+  // pseudo-row, so EVERY delegate has an exact per-row height from here
+  // and scroll math is pure arithmetic (row0, header row included).
   function composeItems(src, withSections) {
-    if (!withSections) return src
     var out = []
-    var last = undefined
-    for (var i = 0; i < src.length; i++) {
-      var s = src[i] ? (src[i].section || "") : ""
-      // A header opens EVERY titled group, including the leading one: on
-      // the queue tab the context section must carry its name even when
-      // nothing is queued above it (rows without a section never get one).
-      if (s !== "" && s !== last) {
-        out.push({ raw: "sec:" + s, sectionRow: true, title: s,
-                   selectable: false, section: s,
-                   showCover: src[i].showCover === true })
-        last = s
+    // The leading block scrolls away with the content, exactly like any
+    // other row; filtering keeps it (it is the view's chrome).
+    if (headerComponent && headerHeight > 0) {
+      out.push({ raw: "hdr:", headerRow: true, selectable: false, section: "" })
+    }
+    if (withSections) {
+      var last = undefined
+      for (var i = 0; i < src.length; i++) {
+        var s = src[i] ? (src[i].section || "") : ""
+        // A header opens EVERY titled group, including the leading one: on
+        // the queue tab the context section must carry its name even when
+        // nothing is queued above it (rows without a section never get one).
+        if (s !== "" && s !== last) {
+          out.push({ raw: "sec:" + s, sectionRow: true, title: s,
+                     selectable: false, section: s,
+                     showCover: src[i].showCover === true })
+          last = s
+        }
+        out.push(src[i])
       }
-      out.push(src[i])
+    } else {
+      for (var j = 0; j < src.length; j++) out.push(src[j])
     }
     return out
   }
@@ -143,9 +139,8 @@ Item {
   }
 
   function setCursor(pos) {
-    dlog("nav: cursor", cursorPos + "->" + pos, "contentY", list.contentY.toFixed(1),
-         "cH", list.contentHeight.toFixed(1), "count", list.count,
-         "originY", list.originY.toFixed(1), "headerH", list.headerItem ? list.headerItem.height.toFixed(1) : "?")
+    dlog("nav: cursor", cursorPos + "->" + pos, "scrollY", scrollY.toFixed(1),
+         "n", items.length)
     cursorPos = pos
     lastRaw = items[pos] ? rawOf(items[pos], pos) : -1
     requestScroll(pos)
@@ -176,12 +171,20 @@ Item {
     jumpCursor(fallback || 0)
   }
 
+  // The view identity of the last items push. When it changes (tab
+  // switch, drill in/out), scroll state from the previous view must not
+  // leak into the new one — under the center rule a stale heldY reads as
+  // a mid-list window that "doesn't line up" with the cursor.
+  property string lastView: ""
+
   onItemsChanged: {
+    var viewChanged = debugName !== lastView
+    lastView = debugName
     dlog("model-reset: before", debugName, "items", items.length,
-         list.contentY.toFixed(1), "held", heldY.toFixed(1),
+         "scrollY", scrollY.toFixed(1),
          "resetting", resettingView, "pendingJump", pendingJumpPrefix,
-         "cH", list.contentHeight.toFixed(1), "h", list.height.toFixed(1),
-         "originY", list.originY.toFixed(1))
+         "viewChanged", viewChanged,
+         "total", contentTotal().toFixed(1), "h", list.height.toFixed(1))
     // During bulk library load the caller streams album batches in and
     // each one reorders the (title-sorted) list as it lands; identity
     // remapping during that churn drifts the cursor (observed: 0 -> 1 on
@@ -189,6 +192,14 @@ Item {
     if (items.length === 0) {
       cursorPos = 0
       lastRaw = -1
+      return
+    }
+    // A new view starts at its top, cursor 0 — before any remap can
+    // apply the previous view's cursor/offset to the new rows.
+    if (viewChanged && pendingJumpPrefix === "") {
+      resettingView = false
+      lastRaw = -1
+      scrollTo(0)
       return
     }
     if (!suppressRemap && lastRaw !== -1) {
@@ -200,12 +211,12 @@ Item {
       }
       if (best >= 0) {
         dlog("remap-id:", "raw", String(lastRaw), "cursor", cursorPos + "->" + best,
-             "n", items.length, "list.count", list.count)
+             "n", items.length)
         cursorPos = best
       } else {
         dlog("remap-clamp:", "raw", String(lastRaw), "cursor", cursorPos + "->" +
              Math.max(0, Math.min(cursorPos, items.length - 1)),
-             "n", items.length, "list.count", list.count)
+             "n", items.length)
         cursorPos = Math.max(0, Math.min(cursorPos, items.length - 1))
       }
     }
@@ -230,16 +241,15 @@ Item {
     if (resettingView) scrollTo(0)
     else if (!modelJumped) restoreHeldY()
     resettingView = false
-    dlog("model-reset: after", list.contentY.toFixed(1), "modelJump", modelJumped,
-         "cursor", cursorPos, "cH", list.contentHeight.toFixed(1),
-         "originY", list.originY.toFixed(1))
+    dlog("model-reset: after", "scrollY", scrollY.toFixed(1), "modelJump", modelJumped,
+         "cursor", cursorPos, "total", contentTotal().toFixed(1))
   }
 
   // Caller queues a prefix: on the next model change the cursor jumps to
   // the first row whose identity starts with it ("" = no-op).
   property string pendingJumpPrefix: ""
 
-  function scrollOffset() { return list.contentY }
+  function scrollOffset() { return scrollY }
 
   signal requestScroll(int pos)
   signal activated(var item)
@@ -248,8 +258,7 @@ Item {
   function activate() {
     if (!cursorItem) return
     dlog("activate: cursor", cursorPos, "raw", String(lastRaw),
-         "contentY", list.contentY.toFixed(1))
-    heldY = list.contentY
+         "scrollY", scrollY.toFixed(1))
     activated(cursorItem)
   }
 
@@ -286,10 +295,11 @@ Item {
     requestScroll(cursorPos)
   }
 
-  // ---- scrolling. One owner: explicit cursor/view commands update the
-  // held offset; Enter only records it, so model pushes cannot move the
-  // visible window.
-  property real heldY: 0
+  // ---- scrolling. One owner: the offset is a plain property, content
+  // y = -scrollY, and every write clamps inside [0, contentTotal - vp].
+  // (No ListView: its internal contentY re-clamps while rederiving
+  // geometry were the source of every scroll glitch in the journal.)
+  property real scrollY: 0
   property bool resettingView: false
   property string debugName: ""
   property bool debug: true
@@ -300,29 +310,21 @@ Item {
     console.log("list2:", args.join(" | "))
   }
 
-  // The content top derived from our own state: minus the header height
-  // the caller declares alongside headerComponent. Do NOT read
-  // list.headerItem here: touching it while the header is being destroyed
-  // (every switch into the headerless queue view) crashed quickshell with
-  // no QML warning.
+  // The leading block (album metadata, queue strip) declares its height
+  // so it takes part in the pure model arithmetic.
   property real headerHeight: 0
-  function contentTop() { return -headerHeight }
 
-
-  // Every write of the offset goes through here so each change of the
-  // visible window can be traced to its cause in the journal.
-  property bool ySetting: false
-  function yWrite(cause, value) {
-    dlog("y-set:", cause, list.contentY.toFixed(1) + "->", value.toFixed(1),
-         "heldY", heldY.toFixed(1))
-    ySetting = true
-    list.contentY = value
-    ySetting = false
+  // Every write of the offset passes through here and cannot leave the
+  // content bounds. One owner, one clamp, at write time.
+  function setScroll(cause, value) {
+    var maxY = Math.max(0, contentTotal() - list.height)
+    var y = Math.max(0, Math.min(value, maxY))
+    dlog("y-set:", cause, scrollY.toFixed(1) + "->", y.toFixed(1))
+    scrollY = y
   }
 
   function scrollToOffset(y) {
-    heldY = y
-    restoreHeldY()
+    setScroll("scrollToOffset", y)
   }
 
   function firstSelectableIndex() {
@@ -331,72 +333,36 @@ Item {
     return items.length
   }
 
+  // Total content height (header pseudo-row + all rows) from the model.
+  function contentTotal() { return cumulativeY(items.length) }
+
   function scrollTo(pos) {
-    if (pos < 0 || list.count === 0) return
+    if (pos < 0 || items.length === 0) return
+    var vp = list.height
+    var total = contentTotal()
+    // A list that fits the viewport has only one position: the top.
+    if (total <= vp) {
+      setScroll("scrollTo fit (cursor " + pos + ")", 0)
+      return
+    }
     // Reaching the very top — by g, by filter commit, or by walking j up
     // to the first selectable row — snaps to the content top so the
     // metadata header (and any lead-in block) is visible again.
     if (pos === 0 || pos <= firstSelectableIndex()) {
-      heldY = contentTop()
-      yWrite("scrollTo head (cursor " + pos + ")", contentTop())
-      Qt.callLater(clampAndHold)
+      setScroll("scrollTo head (cursor " + pos + ")", 0)
       return
     }
-    // Band rule (the old list's "one-row buffer", now exact): the cursor
-    // and its predecessor must both be fully visible; anything else
-    // stays put. contentY ∈ [cursorBottom − viewport, predecessorTop].
-    var top = contentTop()
-    var vp = list.height
-    // One-row buffer (the old Contain pair's intent): going down keeps
-    // the NEXT row peeking below the viewport bottom, going up keeps the
-    // PREVIOUS row above the top edge — the cursor never sits flush
-    // against either edge mid-list.
-    var y = cumulativeY(pos)
-    var h = rowH(pos)
-    var lo = pos + 1 < items.length
-        ? cumulativeY(pos + 1) + rowH(pos + 1) - vp
-        : y + h - vp
-    var hi = y - rowH(pos - 1)
-    var target = Math.max(lo, Math.min(list.contentY, hi))
-    // A list that fits the viewport has only one position: the top
-    // (header in view).
-    if (exactContentHeight() <= vp) target = top
-    // Content spans [contentTop, contentTop + exactHeight]; the bottom
-    // stop must offset the header the same way the top does.
-    heldY = Math.max(top, Math.min(target, contentTop() + exactContentHeight() - vp))
-    yWrite("scrollTo cursor " + pos, heldY)
-    Qt.callLater(clampAndHold)
+    // Center rule: keep the cursor row vertically centered in the
+    // viewport unless the content edge stops us — natural edge behavior
+    // emerges from the clamp inside setScroll alone.
+    var target = cumulativeY(pos) + rowH(pos) / 2 - vp / 2
+    setScroll("scrollTo cursor " + pos, target)
   }
 
-  // Restore trusts heldY verbatim: mid-reset contentHeight is unreliable
-  // (delegates still materializing despite forceLayout), so clamping here
-  // would crush a valid offset down to a smaller bogus maxY. Assign first,
-  // then clamp a frame later against settled geometry.
+  // Restore is a re-derive now: the cursor is the single scroll truth.
   function restoreHeldY() {
-    if (list.count === 0) return
-    yWrite("restoreHeldY", heldY)
-    Qt.callLater(clampAndHold)
-  }
-
-  function clampAndHold() {
-    if (list.count === 0) return
-    list.forceLayout()
-    // heldY is the one owner of the offset. A model reset repositions
-    // the viewport asynchronously at layout time (after this reset's
-    // own restore), so the clamp must REASSERT heldY against the settled
-    // geometry, not merely clamp whatever the ListView left behind —
-    // otherwise the visible window flashes/lands at the top.
-    var minY = contentTop()
-    // draggable content spans [contentTop, contentTop + exactHeight] in
-    // content coordinates (the header hangs above row 0), so the bottom
-    // stop subtracts the top offset too. Forgetting it leaves a strip of
-    // phantom content at the bottom edge.
-    var maxY = Math.max(minY, contentTop() + exactContentHeight() - list.height)
-    var ny = Math.max(minY, Math.min(heldY, maxY))
-    dlog("clamp:", "heldY", heldY.toFixed(1), "ny", ny.toFixed(1),
-         "maxY", maxY.toFixed(1), "cH", list.contentHeight.toFixed(1), "minY", minY.toFixed(1))
-    heldY = ny
-    yWrite("clampAndHold", ny)
+    if (items.length === 0) return
+    scrollTo(cursorPos)
   }
 
   // Returns true when the event was consumed; unhandled keys stay
@@ -486,7 +452,14 @@ Item {
     }
   }
 
-  ListView {
+  // ---- the scroller. A plain Item: we OWN the offset directly instead
+  // of delegating it to a ListView, whose own repricing (originY/contentY
+  // re-clamps during delegate (re)instantiation) kept fighting every
+  // scheme in this file — the source of ever scroll glitch in the
+  // journal. Every row (leading block included) is an exact-height
+  // pseudo-row, so the position is pure arithmetic and the visible
+  // window CANNOT leave the content bounds.
+  Item {
     id: list
     anchors.top: parent.top
     anchors.topMargin: list2.filterable ? Style.space(34) : 0
@@ -494,116 +467,82 @@ Item {
     anchors.bottom: parent.bottom
     width: parent.width - Style.space(18)
     clip: true
-    model: list2.items
-    highlight: null
-    verticalLayoutDirection: list2.reversed ? ListView.BottomToTop : ListView.TopToBottom
-    boundsBehavior: Flickable.StopAtBounds
-    // Materialize delegates near the edges too, so the band check sees
-    // them instead of treating a laid-out row as unloaded.
-    cacheBuffer: list.height > 0 ? list.height * 2 : 320
-    // The header must have a definite height or contentHeight misses it
-    // (observed: c = sum of rows only), which breaks scroll bounds. Only
-    // attach the component when there is one: an always-present empty
-    // header wrapper leaves a stray zero-height item in the content that
-    // corrupts originY/contentHeight bookkeeping.
-    header: list2.headerComponent ? hdrComp : null
-    Component {
-      id: hdrComp
-      Item {
-        implicitHeight: hdrLoader.item ? hdrLoader.item.implicitHeight : 0
-        height: implicitHeight
-        Loader {
-          id: hdrLoader
-          sourceComponent: list2.headerComponent
+
+    // A Repeater (unlike a ListView) keeps every delegate ALIVE: layout
+    // can never half-materialize, so offsets depend only on our
+    // arithmetic.
+    Column {
+      id: contentCol
+      width: list.width
+      // The offset is ours; nothing internal ever writes it (no wheel,
+      // no flick physics): every move is from the cursor scrollers and
+      // reset paths below or an explicit scrollToOffset.
+      y: -list2.scrollY
+
+      Repeater {
+        model: list2.items
+        // The delegate wrapper's height is the data-driven per-row
+        // height (rowHeightOf).
+        delegate: Item {
+          id: rowWrap
+          objectName: "row" + index
+          required property var modelData
+          required property int index
+          width: list.width
+          implicitHeight: list2.rowHeightOf(modelData)
+          height: implicitHeight
+
+          Loader {
+            id: rowLoader
+            anchors.fill: parent
+            // The leading block (album metadata, queue strip) is a
+            // pseudo-row: dispatch its component instead of the row
+            // template.
+            sourceComponent: rowWrap.modelData.headerRow === true
+              ? list2.headerComponent : list2.rowDelegate
+            property var modelData: rowWrap.modelData
+            property int index: rowWrap.index
+          }
+
+          // Declarative bindings: the row's inputs update with the
+          // model, the cursor and the transient flash — nothing is
+          // assigned imperatively.
+          Binding {
+            target: rowLoader.item
+            property: "modelData"
+            value: rowWrap.modelData
+            when: rowLoader.item !== null
+          }
+          Binding {
+            target: rowLoader.item
+            property: "index"
+            value: rowWrap.index
+            when: rowLoader.item !== null
+          }
+          Binding {
+            target: rowLoader.item
+            property: "isCursor"
+            value: rowWrap.index === list2.cursorPos && !list2.filtering
+            when: rowLoader.item !== null
+          }
+          Binding {
+            target: rowLoader.item
+            property: "isFav"
+            value: list2.favSet[rowWrap.modelData ? rowWrap.modelData.trackId : ""] === true
+            when: rowLoader.item !== null
+          }
+          Binding {
+            target: rowLoader.item
+            property: "flashText"
+            value: (list2.flash !== null
+                    && list2.flash.raw === list2.rawOf(rowWrap.modelData, rowWrap.index)) ? list2.flash.text : ""
+            when: rowLoader.item !== null
+          }
         }
       }
     }
 
-    // The delegate wrapper is always instantiated and its height is the
-    // caller's constant rowHeight — known to ListView before any layout,
-    // so contentHeight is exact from the first pass. The Loader swaps the
-    // row component per tab without touching geometry.
-    delegate: Item {
-      id: rowWrap
-      objectName: "row" + index
-      required property var modelData
-      required property int index
-      width: list.width
-      implicitHeight: list2.rowHeightOf(modelData)
-      height: implicitHeight
-
-      Loader {
-        id: rowLoader
-        anchors.fill: parent
-        sourceComponent: list2.rowDelegate
-        property var modelData: rowWrap.modelData
-        property int index: rowWrap.index
-      }
-
-      // Declarative bindings: the row's inputs update with the model, the
-      // cursor and the transient flash — nothing is assigned imperatively.
-      Binding {
-        target: rowLoader.item
-        property: "modelData"
-        value: rowWrap.modelData
-        when: rowLoader.item !== null
-      }
-      Binding {
-        target: rowLoader.item
-        property: "index"
-        value: rowWrap.index
-        when: rowLoader.item !== null
-      }
-      Binding {
-        target: rowLoader.item
-        property: "isCursor"
-        value: rowWrap.index === list2.cursorPos && !list2.filtering
-        when: rowLoader.item !== null
-      }
-      Binding {
-        target: rowLoader.item
-        property: "isFav"
-        value: list2.favSet[rowWrap.modelData ? rowWrap.modelData.trackId : ""] === true
-        when: rowLoader.item !== null
-      }
-      Binding {
-        target: rowLoader.item
-        property: "flashText"
-        value: (list2.flash !== null
-                && list2.flash.raw === list2.rawOf(rowWrap.modelData, rowWrap.index)) ? list2.flash.text : ""
-        when: rowLoader.item !== null
-      }
-    }
-
-    // Viewport moves we did not make — typically ListView's async
-    // post-reset reposition — reassert heldY immediately (synchronous in
-    // this handler, so a repositioned frame can never paint). While the
-    // user is wheel-scrolling/flicking, adopt the real position into
-    // heldY instead; it is committed when the movement ends.
-    onContentYChanged: {
-      if (list2.ySetting) return
-      list2.dlog("y-external:", "contentY", list.contentY.toFixed(1),
-                 "heldY", list2.heldY.toFixed(1))
-      if (list.moving || list.flicking) { list2.heldY = list.contentY; return }
-      var minY = list2.contentTop()
-      var maxY = Math.max(minY, list2.contentTop() + list2.exactContentHeight() - list.height)
-      if (list2.heldY < minY - 0.01 || list2.heldY > maxY + 0.01) {
-        // heldY is out of the content's valid range (viewport or content
-        // changed): adopt the position the layout chose.
-        list2.heldY = list.contentY
-        return
-      }
-      if (Math.abs(list.contentY - list2.heldY) > 0.01) {
-        list2.dlog("y-revert:", "external", list.contentY.toFixed(1) + "->", list2.heldY.toFixed(1))
-        list2.ySetting = true
-        list.contentY = list2.heldY
-        list2.ySetting = false
-      }
-    }
-    onMovementEnded: {
-      list2.dlog("y-move-end:", "contentY", list.contentY.toFixed(1))
-      list2.heldY = list.contentY
-    }
+    // Cursor-driven scroll requests land here.
     Connections {
       target: list2
       function onRequestScroll(pos) { list2.scrollTo(pos) }
@@ -625,7 +564,15 @@ Item {
       x: Style.space(16)
       anchors.verticalCenter: parent.verticalCenter
       textFormat: Text.PlainText
-      readonly property int edgeIndex: list.indexAt(list.width / 2, list.height - 2)
+      // Pure-math replacement of the old list.indexAt: the first row
+      // whose top is at the viewport bottom edge.
+      readonly property int edgeIndex: {
+        var y = list2.scrollY + list.height - 2
+        for (var i = list2.items.length - 1; i >= 0; i--) {
+          if (list2.cumulativeY(i) <= y) return i
+        }
+        return -1
+      }
       text: edgeIndex >= 0 && list2.items[edgeIndex] !== undefined
         ? (list2.items[edgeIndex].section || "") : ""
       color: Qt.darker(Color.foreground, 1.3)
@@ -637,7 +584,7 @@ Item {
 
   // Scroll progress (read-only): derived from the content's real extents.
   Rectangle {
-    visible: list.contentHeight > list.height + 1
+    visible: list2.contentTotal() > list.height + 1
     x: parent.width - width
     y: 0
     width: Style.space(4)
@@ -650,11 +597,11 @@ Item {
       radius: width / 2
       color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.35)
       readonly property real progress: {
-        var range = list.contentHeight - list.height
+        var range = list2.contentTotal() - list.height
         if (range <= 0) return 0
-        return Math.max(0, Math.min(1, (list.contentY - contentTop()) / range))
+        return Math.max(0, Math.min(1, list2.scrollY / range))
       }
-      readonly property real frac: Math.min(1, list.height / Math.max(1, list.contentHeight))
+      readonly property real frac: Math.min(1, list.height / Math.max(1, list2.contentTotal()))
       height: Math.max(Style.space(24), parent.height * frac)
       y: progress * (parent.height - height)
     }
