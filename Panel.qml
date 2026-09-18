@@ -33,7 +33,11 @@ Panel {
     }
     var key = keys[name] !== undefined ? keys[name] : 0
     var text = name.length === 1 ? name : ""
-    panel.handleGlobalKey({ key: key, text: text, isAutoRepeat: false, accepted: false })
+    var ev = { key: key, text: text, isAutoRepeat: false, accepted: false }
+    // Mirror the real focus path: while the palette is open keys land on
+    // the modal, not the panel router.
+    if (paletteOpen) handlePaletteKey(ev)
+    else panel.handleGlobalKey(ev)
   }
   readonly property var barIdentity: hostWidget || root
 
@@ -303,39 +307,31 @@ Panel {
   // ---- List tabs. List owns cursor, filtering and scrolling; the panel
   //      supplies rows, actions, and tab state.
   property string openAlbumId: ""
-  property string playbackAlbumId: ""
-  onOpenAlbumIdChanged: {
-    console.info("jelly: album changed", openAlbumId)
-    // The "reopen the playing album" convenience applies only while on
-    // the albums tab; during a tab switch restoreViewState clears
-    // openAlbumId for the OTHER views and must not be overwritten here
-    // (the queue/commands lists would otherwise inherit a phantom album:
-    // 40-tall rows with 44-tall covers overflowing them).
-    if (tab === "albums" && openAlbumId === "" && playbackAlbumId !== "")
-      openAlbumId = playbackAlbumId
-  }
 
-  // Per-view state (cursor + filter + drilled album), so each
-  // tab keeps its own position when you switch back and forth.
+  // Per-view state (cursor identity + filter + drilled album), so each
+  // tab keeps its own position when you switch back and forth. The
+  // scroll offset is never stored: it is a pure function of the cursor
+  // (List centers the row it is on), so restoring the row restores the
+  // view exactly.
   function saveViewState() {
-    console.info("jelly: save view", tab, "cursor", mainList.cursorPos, "raw", String(mainList.lastRaw))
+    console.info("jelly: save view", tab, "raw", String(mainList.lastRaw))
     var m = viewStates
-    m[tab] = { cursor: mainList.cursorPos, raw: mainList.lastRaw,
-               filter: mainList.filterText, albumId: openAlbumId,
-               contentY: mainList.scrollOffset() }
+    m[tab] = { raw: mainList.lastRaw, filter: mainList.filterText,
+               albumId: openAlbumId }
     viewStates = m
   }
   function restoreViewState() {
     var st = viewStates[tab]
-    console.info("jelly: restore view", tab, st ? "cursor " + String(st.cursor) + " raw " + String(st.raw) : "empty state")
+    console.info("jelly: restore view", tab, st ? "raw " + String(st.raw) : "empty state")
     openAlbumId = st ? (st.albumId || "") : ""
     mainList.filterText = st ? (st.filter || "") : ""
-    mainList.cursorPos = st ? (st.cursor || 0) : 0
-    mainList.lastRaw = st ? (st.raw !== undefined ? st.raw : -1) : -1
-    // Restore the exact scroll offset, not a recomputed one: no flash at
-    // the top, no partial scroll to the cursor.
-    if (st && st.contentY !== undefined && st.contentY >= 0) mainList.scrollToOffset(st.contentY)
-    else mainList.resetCursor()
+    if (st && st.raw !== undefined && st.raw !== -1) {
+      // Land on the stored row; List's model-change view reset parks the
+      // cursor at 0 first, so the focus pass runs after items settle.
+      Qt.callLater(function() { mainList.focusRaw(st.raw, 0) })
+    } else {
+      mainList.resetCursor()
+    }
   }
 
   // Metadata for the drilled album view (MetaHeader).
@@ -422,12 +418,16 @@ Panel {
       // Lazy drill: one tracks fetch on first entry, cached in tracksLoaded.
       if (!(al.tracks || []).length && !tracksLoaded[al.id] && connected)
         browse("browse_tracks", { album_id: al.id })
+      // Build the context metas ONCE per view and share the array across
+      // rows: per-row albumMetas() copies made every push O(n^2).
+      // Activation only reads them, never mutates.
+      var metas = albumMetas(al)
       return (al.tracks || []).map(function(t, idx) {
         return { raw: t.id, trackId: t.id, title: t.title, artist: t.artist || "",
                  durationSecs: t.length || null,
                  sub: (t.artist || "") + (t.length ? "  ·  " + Util.fmt(t.length) : ""),
                  cover: al.cover, playing: t.id === now.id, section: "",
-                 ctxIndex: idx, metas: albumMetas(al) }
+                 ctxIndex: idx, metas: metas }
       })
     }
     if (tab === "commands") {
@@ -452,7 +452,6 @@ Panel {
         return
       }
       if (item.metas) {
-        playbackAlbumId = openAlbumId
         startPlayback(item.metas, item.ctxIndex || 0)
         return
       }
@@ -527,13 +526,12 @@ Panel {
   }
 
   function focusPlayingRow() {
-    var rows = viewRows()
-    for (var i = 0; i < rows.length; i++) {
-      if (rows[i].trackId !== undefined && rows[i].trackId === now.id) {
-        mainList.jumpCursor(i)
-        return
-      }
-    }
+    // Focus whatever row is marked playing: a track row in a drill/queue
+    // view, or the album row owning the current context in an overview.
+    // The flag is the same one the delegate renders (bold + glyph), so o
+    // always lands on the row the UI says is playing. No-op when the
+    // playing song has no row here (e.g. a queue head).
+    mainList.focusRowWhere(function(it) { return it.playing === true })
   }
 
   Timer {
@@ -545,7 +543,9 @@ Panel {
   function drillBack() {
     if (tab === "albums" && openAlbumId !== "") {
       var cameFrom = openAlbumId
-      playbackAlbumId = ""
+      // Popping a level clears the drill view's filter (the original
+      // rule); the re-park it attempts is overridden by the view reset.
+      mainList.clearFilter()
       mainList.beginViewReset()
       openAlbumId = ""
       // Land back on the album we came from (cursor + scroll).
@@ -582,11 +582,10 @@ Panel {
     if (snap.repeat === "one") send({ type: "set_repeat", mode: "off" })
   }
 
-  // ---- command palette (?): every keybind, filterable. One filter char
-  //      matches keybinds; multiple chars match descriptions.
+  // ---- command palette (?): every keybind, filterable. Rendered by the
+  //      same List component as the main views so cursor/scroll/filter
+  //      behavior is identical everywhere.
   property bool paletteOpen: false
-  property bool paletteFiltering: false
-  property int paletteCursor: 0
 
   readonly property var commands: [
     { key: "j", desc: "Move cursor down" },
@@ -618,30 +617,33 @@ Panel {
     { key: "?", desc: "Command palette" }
   ]
 
-  readonly property var paletteItems: {
-    var f = paletteFilter.toLowerCase()
-    if (f === "") return commands
-    if (f.length === 1)
-      return commands.filter(function(c) { return c.key.toLowerCase().indexOf(f) >= 0 })
-    return commands.filter(function(c) { return c.desc.toLowerCase().indexOf(f) >= 0 })
-  }
-  onPaletteItemsChanged:
-    paletteCursor = Math.max(0, Math.min(paletteCursor, paletteItems.length - 1))
-
-  property string paletteFilter: ""
+  // The palette's rows: one per keybind. The List component owns the
+  // cursor and the filter (1-char matches keys, longer matches descs).
+  readonly property var paletteRows: commands.map(function(c) {
+    return { raw: c.key, key: c.key, desc: c.desc, section: "" }
+  })
 
   function openPalette() {
     paletteOpen = true
-    paletteFiltering = false
-    paletteFilter = ""
-    paletteCursor = 0
-    Qt.callLater(function() { paletteModal.forceActiveFocus() })
+    Qt.callLater(function() {
+      paletteList.filterText = ""
+      paletteList.resetCursor()
+      paletteModal.forceActiveFocus()
+    })
   }
 
   function closePalette() {
     paletteOpen = false
-    paletteFiltering = false
     Qt.callLater(function() { keyFocus.forceActiveFocus() })
+  }
+
+  // Palette key router (shared by the modal's Keys handler and the
+  // headless injectKey seam).
+  function handlePaletteKey(event) {
+    if (event.key === Qt.Key_PageUp) { paletteList.jumpCursor(paletteList.cursorPos - 8); event.accepted = true; return }
+    if (event.key === Qt.Key_PageDown) { paletteList.jumpCursor(paletteList.cursorPos + 8); event.accepted = true; return }
+    paletteList.handleKey(event)
+    event.accepted = true
   }
 
   function togglePlay() { send({ type: "toggle_play" }) }
@@ -700,8 +702,6 @@ Panel {
   // Library arrives over the socket (browse IPC); refresh when auth
   // becomes available and after each reconnect.
   onSnapChanged: {
-    if (tab === "albums" && playbackAlbumId !== "" && openAlbumId === "")
-      openAlbumId = playbackAlbumId
     if (snap.auth !== lastAuthStatus) {
       lastAuthStatus = snap.auth || ""
       // A pre-login browse can fail and leave the in-flight guard set.
@@ -1062,7 +1062,9 @@ Panel {
         drillHook: function() {
           var it = mainList.cursorItem
           if (root.tab === "albums" && it && it.isAlbum) {
-            root.playbackAlbumId = ""
+            // Drilling in clears the filter (the original rule): the new
+            // view starts fresh, unfiltered, at the top.
+            mainList.clearFilter()
             mainList.beginViewReset()
             root.openAlbumId = it.albumId
               Qt.callLater(function() {
@@ -1078,7 +1080,6 @@ Panel {
           return false
         }
         onActivated: item => root.activateRow(item)
-        onActionTriggered: (action, item) => root.rowAction(action, item)
       }
 
       }
@@ -1102,126 +1103,29 @@ Panel {
           border.width: Math.max(1, Style.space(1))
           border.color: Color.popups.border
 
-          Keys.onPressed: function(event) {
-            var t = event.text
-            if (event.key === Qt.Key_Escape || t === "h") { root.closePalette(); event.accepted = true; return }
-            if (event.key === Qt.Key_Down || t === "j") { root.paletteCursor = Math.min(root.paletteItems.length - 1, root.paletteCursor + 1); event.accepted = true; return }
-            if (event.key === Qt.Key_Up || t === "k") { root.paletteCursor = Math.max(0, root.paletteCursor - 1); event.accepted = true; return }
-            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.closePalette(); event.accepted = true; return }
-            if (t === "/") {
-              root.paletteFiltering = true
-              Qt.callLater(function() { paletteInput.forceActiveFocus() })
-              event.accepted = true
-              return
-            }
-          }
+          // Everything the shared List doesn't consume is irrelevant to
+          // the palette; PgUp/PgDn page the cursor by 8 as before.
+          Keys.onPressed: function(event) { root.handlePaletteKey(event) }
 
-          onFocusChanged: if (!focus && visible && !root.paletteFiltering) forceActiveFocus()
+          onFocusChanged: if (!focus && visible) forceActiveFocus()
 
-          Column {
+          // Same component as the main views: prompt, live filter (1 char
+          // matches keybinds, longer text matches descriptions), cursor,
+          // centered scrolling, g/G. Esc/h closes the palette (backHook);
+          // Enter closes it (activation is display-only here).
+          List {
+            id: paletteList
             anchors.fill: parent
             anchors.margins: Style.space(12)
-            spacing: Style.space(8)
-
-            // Filter mode input; the dimmed "/" prompt takes its place in
-            // navigate mode, same as the main views.
-            TextField {
-              id: paletteInput
-              visible: root.paletteFiltering
-              width: parent.width
-              height: tabsRow.height
-              placeholderText: "filter commands…"
-              foreground: Color.foreground
-              onVisibleChanged: if (visible) { text = ""; forceActiveFocus() }
-              onTextChanged: root.paletteFilter = text
-              Keys.onPressed: function(event) {
-                // In filter mode: Esc clears the text first, then a second
-                // Esc exits back to navigate mode. Enter commits (and the
-                // cursor restarts at the first match). Focus moves
-                // synchronously so keys can never fall between the two
-                // modes and get swallowed.
-                if (event.key === Qt.Key_Escape) {
-                  root.paletteFiltering = false
-                  root.paletteFilter = ""
-                  paletteModal.forceActiveFocus()
-                  event.accepted = true
-                  return
-                }
-                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                  // Commit the filter: start at the first match.
-                  root.paletteFiltering = false
-                  root.paletteCursor = 0
-                  paletteModal.forceActiveFocus()
-                  event.accepted = true
-                  return
-                }
-              }
-            }
-
-            Item {
-              visible: !root.paletteFiltering
-              width: parent.width
-              height: tabsRow.height
-
-              Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(4)
-                anchors.verticalCenter: parent.verticalCenter
-                textFormat: Text.PlainText
-                text: "/ filter commands"
-                color: Qt.darker(Color.foreground, 1.4)
-                font.family: Style.font.family
-                font.pixelSize: Style.font.body
-              }
-            }
-
-            ListView {
-              width: parent.width
-              height: parent.height - tabsRow.height - Style.space(8)
-              clip: true
-              model: root.paletteItems
-              currentIndex: root.paletteCursor
-              boundsBehavior: Flickable.StopAtBounds
-
-              delegate: Item {
-                required property var modelData
-                required property int index
-                width: ListView.view.width
-                height: commandText.implicitHeight + Style.space(10)
-
-                Rectangle {
-                  anchors.fill: parent
-                  color: !root.paletteFiltering && index === root.paletteCursor ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : "transparent"
-                }
-
-                Row {
-                  x: Style.space(12)
-                  anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(14)
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: modelData.key
-                    color: Color.accent
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.body
-                    font.bold: true
-                    width: Style.space(96)
-                  }
-
-                  Text {
-                    id: commandText
-                    textFormat: Text.PlainText
-                    text: modelData.desc
-                    color: Color.foreground
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
-                    width: Style.space(400)
-                  }
-                }
-              }
-            }
+            debugName: "palette"
+            rows: root.paletteRows
+            filterable: true
+            filterFn: Util.filterByKeyOrDesc
+            rowDelegate: commandRowComp
+            rowHeight: Style.space(32)
+            emptyText: "No matches"
+            backHook: function() { root.closePalette(); return true }
+            onActivated: item => root.closePalette()
           }
         }
       }
