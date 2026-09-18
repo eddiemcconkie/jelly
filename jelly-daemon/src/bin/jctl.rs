@@ -67,6 +67,7 @@ fn build_message(args: &[String]) -> (ClientKind, Option<u64>) {
             K::Play {
                 tracks: args.iter().skip(1).map(|id| track_placeholder(id)).collect(),
                 start_index: 0,
+                clear_queue: false,
             },
             req_id,
         ),

@@ -231,6 +231,9 @@ Item {
     if (items.length === 0) {
       cursorPos = 0
       lastRaw = -1
+      // Nothing here: we ARE at the top. Don't let a queued top-jump
+      // survive to ambush the next unrelated model change.
+      pendingTopJump = false
       return
     }
     // A new view starts at its top — cursor on the first SELECTABLE row
@@ -238,8 +241,9 @@ Item {
     // before any remap can apply the previous view's cursor to the new
     // rows. Parking on row 0 would hide the cursor there: pseudo-rows
     // render no cursor, which looked like "no cursor until you hit j".
-    if (viewChanged && pendingJumpPrefix === "") {
+    if ((viewChanged && pendingJumpPrefix === "") || pendingTopJump) {
       resettingView = false
+      pendingTopJump = false
       lastRaw = -1
       cursorPos = 0
       jumpCursor(0)
@@ -293,6 +297,14 @@ Item {
   // Caller queues a prefix: on the next model change the cursor jumps to
   // the first row whose identity starts with it ("" = no-op).
   property string pendingJumpPrefix: ""
+
+  // Caller demands a plain top-of-view jump on the next model change
+  // (queue-tab jump_to: rows above the cursor get consumed, the cursor
+  // must rejoin the top, not keep its index). A flag rather than a
+  // prefix: prefix searches can miss (queue exhausted) or be consumed
+  // by an unrelated model change, leaving the index-preservation clamp
+  // as the fallback.
+  property bool pendingTopJump: false
 
   function scrollOffset() { return list.contentY }
 

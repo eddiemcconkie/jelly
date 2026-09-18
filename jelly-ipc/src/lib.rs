@@ -35,11 +35,16 @@ pub enum ClientKind {
     /// never accepts a password over the socket.
     Login,
     /// Replace the playback context (loaded album/playlist) and start
-    /// playing at `start_index`. Any waiting queue survives.
+    /// playing at `start_index`. The waiting queue survives by default;
+    /// the currently-playing queue head is always dropped (starting
+    /// something new means moving on from it). `clear_queue: true` (the
+    /// queue tab's "play this row now") consumes the waiting queue too.
     Play {
         tracks: Vec<TrackMeta>,
         #[serde(default)]
         start_index: usize,
+        #[serde(default)]
+        clear_queue: bool,
     },
     /// Play an album without the client needing its track list: the daemon
     /// fetches the album's tracks itself and starts at track 0.
@@ -302,6 +307,7 @@ mod tests {
                     stream_url: "http://x/stream".into(),
                 }],
                 start_index: 0,
+                clear_queue: false,
             },
             Some(42),
         );
@@ -310,6 +316,26 @@ mod tests {
         assert!(json.contains("\"req_id\":42"));
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, msg);
+    }
+
+    /// Old clients omit `clear_queue`; it must default to false (the queue
+    /// survives a plain Play). The queue-tab takeover sends true.
+    #[test]
+    fn play_clear_queue_defaults_false_and_parses_true() {
+        let back: ClientMessage =
+            serde_json::from_str("{\"type\":\"play\",\"tracks\":[],\"start_index\":3}")
+                .unwrap();
+        assert_eq!(
+            back.kind,
+            ClientKind::Play { tracks: vec![], start_index: 3, clear_queue: false }
+        );
+        let back: ClientMessage =
+            serde_json::from_str("{\"type\":\"play\",\"tracks\":[],\"clear_queue\":true}")
+                .unwrap();
+        assert_eq!(
+            back.kind,
+            ClientKind::Play { tracks: vec![], start_index: 0, clear_queue: true }
+        );
     }
 
     #[test]

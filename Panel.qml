@@ -458,15 +458,17 @@ Panel {
     }
     if (tab === "queue") {
       if (item.queueIndex !== undefined && item.queueIndex !== null) {
-        // jump_to consumes this item and everything before it. After the
-        // model update, focus the first remaining queue row; album/context
-        // activation below must not move the scroll at all.
-        mainList.pendingJumpPrefix = "q:"
+        // jump_to consumes this item and everything before it. The rows
+        // above the cursor vanish, so the cursor must rejoin the top of
+        // the remaining list on the next push (pendingTopJump) rather
+        // than keep its index — queue view only.
+        mainList.pendingTopJump = true
         mainList.jumpCursor(0)
         send({ type: "jump_to", index: item.queueIndex }); return
       }
       if (item.ctxIndex !== undefined && item.ctxIndex !== null && item.metas) {
-        startPlayback(item.metas, item.ctxIndex); return
+        mainList.pendingTopJump = true
+        startPlayback(item.metas, item.ctxIndex, true); return
       }
     }
   }
@@ -577,8 +579,13 @@ Panel {
   // Start a (re)selection: loading a fresh context resets repeat-one to
   // plain repeat — nobody wants one song looping forever after picking a
   // new album.
-  function startPlayback(tracks, startIndex) {
-    send({ type: "play", tracks: tracks, start_index: startIndex })
+  // `consumeQueue` is the queue tab's semantics: the list is "what plays
+  // next", so picking a row makes everything above it past — the waiting
+  // queue goes too. Other tabs leave the queue alone (only the daemon-side
+  // head rule applies: the interrupted song is dropped, not resurrected).
+  function startPlayback(tracks, startIndex, consumeQueue) {
+    send({ type: "play", tracks: tracks, start_index: startIndex,
+           clear_queue: consumeQueue === true })
     if (snap.repeat === "one") send({ type: "set_repeat", mode: "off" })
   }
 
@@ -592,7 +599,7 @@ Panel {
     { key: "k", desc: "Move cursor up" },
     { key: "Enter", desc: "Play selection (album/playlist from start)" },
     { key: "l", desc: "Into view (drill)" },
-    { key: "h", desc: "Out of view / close" },
+    { key: "h", desc: "Out of view (top level: nothing)" },
     { key: "Esc", desc: "Clear filter / out of view / close" },
     { key: "H", desc: "Previous tab" },
     { key: "L", desc: "Next tab" },
@@ -773,7 +780,9 @@ Panel {
         if (event.key === Qt.Key_Escape) {
           root.close(); event.accepted = true; return
         }
-        if (event.key === Qt.Key_Left || t === "h") { root.close(); event.accepted = true; return }
+        // h is drill-back only (List's backHook handles it): at the top
+        // level it does nothing. Left and Esc are the close keys.
+        if (event.key === Qt.Key_Left) { root.close(); event.accepted = true; return }
         if (event.key === Qt.Key_Space) { root.togglePlay(); event.accepted = true; return }
         if (t === "s") {
           send({ type: "set_shuffle", on: !(snap.shuffle) })

@@ -42,6 +42,15 @@
   unlocked for auth (or the unlock prompt handles it).
 
 ## Testing / fixtures
+- **Daemon tests are permanent and must be exercised:** run `cargo test`
+  (workspace root) before and after ANY change to `jelly-daemon/` or
+  `jelly-ipc/`. The playback model transitions (queue consumption, head
+  rules, context takeover) are covered there; a failing test is a signal
+  the semantics changed, not something to delete. Playback semantics
+  (approved 2026-09-18): starting a new context drops the playing queue
+  head (never resurrects it); waiting queue survives except `play` with
+  `clear_queue: true` (queue-tab activation — "everything above the pick
+  is past").
 - **Headless UI testing (no manual keyboard):** the widget accepts IPC from
   `omarchy-shell eddie.jelly <cmd>`:
   - `toggle` / `open` / `close` — the popup panel

@@ -13,8 +13,8 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub enum AppCommand {
     /// Replace the playback context and start playing at `start_index`.
-    /// The queue survives.
-    Play { tracks: Vec<TrackMeta>, start_index: usize },
+    /// The waiting queue survives unless `clear_queue` (queue-tab pick).
+    Play { tracks: Vec<TrackMeta>, start_index: usize, clear_queue: bool },
     /// Play an album by id: the daemon fetches its tracks and starts at 0.
     PlayAlbum { album_id: String },
     Pause,
@@ -156,7 +156,7 @@ impl Coordinator {
         let old = self.build_snapshot();
         match cmd {
             AppCommand::Login => self.login().await,
-            AppCommand::Play { mut tracks, start_index } => {
+            AppCommand::Play { mut tracks, start_index, clear_queue } => {
                 self.rebuild_stream_urls(&mut tracks);
                 if tracks.is_empty() {
                     return;
@@ -164,7 +164,7 @@ impl Coordinator {
                 let name = tracks[0].album.clone();
                 let artist = tracks[0].artist.clone();
                 let image = tracks[0].image_url.clone();
-                let t = self.model.set_context(name, artist, image, tracks, start_index);
+                let t = self.model.set_context(name, artist, image, tracks, start_index, clear_queue);
                 self.apply(t);
             }
             AppCommand::PlayAlbum { album_id } => {
@@ -367,7 +367,7 @@ impl Coordinator {
         let artist = tracks[0].artist.clone();
         let t = self
             .model
-            .set_context(name, artist, self.client.image_url(&album), tracks, 0);
+            .set_context(name, artist, self.client.image_url(&album), tracks, 0, false);
         self.apply(t);
     }
 

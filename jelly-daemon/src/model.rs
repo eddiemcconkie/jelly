@@ -92,8 +92,12 @@ impl PlaybackModel {
         }
     }
 
-    /// Load a new playback context and start at `start_index`. The queue
-    /// survives untouched.
+    /// Load a new playback context and start at `start_index`. The
+    /// currently-playing queue head is DROPPED, never resurrected: moving
+    /// on to something new means the interrupted song doesn't sneak back
+    /// onto the queue. Waiting songs survive (they're a deliberate list)
+    /// unless `clear_queue` — the queue tab's "play this row now", where
+    /// everything at or above the pick is past.
     pub fn set_context(
         &mut self,
         name: impl Into<String>,
@@ -101,16 +105,16 @@ impl PlaybackModel {
         image_url: Option<String>,
         tracks: Vec<TrackMeta>,
         start_index: usize,
+        clear_queue: bool,
     ) -> Transition {
         let start_index = start_index.min(tracks.len().saturating_sub(1));
         let mut ctx = Context::new(name, artist, image_url, tracks);
         ctx.pos = Some(start_index);
         self.context = Some(ctx);
         self.last_context_pos = Some(start_index);
-        // Starting a new context takes over from the queue: the head (if
-        // any was playing) is dropped back onto the front of the queue.
-        if let Some(head) = self.head.take() {
-            self.queue.insert(0, head);
+        self.head = None;
+        if clear_queue {
+            self.queue.clear();
         }
         match self.context.as_ref().unwrap().track_at(start_index) {
             Some(t) => Transition::Play(t.clone()),
@@ -358,7 +362,7 @@ mod tests {
 
     fn model(tracks: &[&str], start: usize) -> (PlaybackModel, Vec<TrackMeta>) {
         let mut m = PlaybackModel::new();
-        m.set_context("Album", "Artist", None, tracks.iter().map(|t| track(t)).collect(), start);
+        m.set_context("Album", "Artist", None, tracks.iter().map(|t| track(t)).collect(), start, false);
         let seq = vec![track(tracks[start])];
         (m, seq)
     }
@@ -367,11 +371,34 @@ mod tests {
     fn set_context_plays_start_index_and_keeps_queue() {
         let mut m = PlaybackModel::new();
         m.play_next(track("q1"));
-        let t = m.set_context("Album", "A", None, vec![track("1"), track("2")], 1);
+        let t = m.set_context("Album", "A", None, vec![track("1"), track("2")], 1, false);
         assert_eq!(t, Transition::Play(track("2")));
         assert_eq!(m.context.as_ref().unwrap().pos, Some(1));
-        // The queued song was pushed back in front of the queue.
+        // A deliberate waiting queue survives an album-tab play.
         assert_eq!(m.queue, vec![track("q1")]);
+        assert_eq!(m.head, None);
+    }
+
+    #[test]
+    fn set_context_drops_playing_head_never_resurrects() {
+        let mut m = PlaybackModel::new();
+        m.enqueue(vec![track("q1"), track("q2")]);
+        assert_eq!(m.next(), Transition::Play(track("q1"))); // q1 is the head
+        let t = m.set_context("Album", "A", None, vec![track("1"), track("2")], 0, false);
+        assert_eq!(t, Transition::Play(track("1")));
+        // The interrupted queue song is gone for good; the waiting rest stays.
+        assert_eq!(m.head, None);
+        assert_eq!(m.queue, vec![track("q2")]);
+    }
+
+    #[test]
+    fn clear_queue_consumes_head_and_waiting_rows() {
+        let mut m = PlaybackModel::new();
+        m.enqueue(vec![track("q1"), track("q2"), track("q3")]);
+        assert_eq!(m.next(), Transition::Play(track("q1")));
+        let t = m.set_context("Album", "A", None, vec![track("1"), track("2")], 1, true);
+        assert_eq!(t, Transition::Play(track("2")));
+        assert!(m.queue.is_empty());
         assert_eq!(m.head, None);
     }
 

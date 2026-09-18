@@ -233,8 +233,8 @@ fn handle_client_msg(
             let _ = cmd_tx.send(AppCommand::Login);
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
-        ClientKind::Play { tracks, start_index } => {
-            let _ = cmd_tx.send(AppCommand::Play { tracks, start_index });
+        ClientKind::Play { tracks, start_index, clear_queue } => {
+            let _ = cmd_tx.send(AppCommand::Play { tracks, start_index, clear_queue });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::PlayAlbum { album_id } => {
