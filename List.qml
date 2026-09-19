@@ -416,6 +416,11 @@ Item {
   // unaccepted so they can forward to the panel's own handler.
   function handleKey(event) {
     var t = event.text
+    // Enter is an action key, never a held one: auto-repeat must not
+    // re-activate rows (restart playback every frame) or re-commit the
+    // filter. Handled here so every List user (main, palette) inherits it.
+    if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+        && event.isAutoRepeat) { return true }
     // Filter mode: type into the prompt, Enter commits, Esc cancels.
     if (filtering) {
       if (event.key === Qt.Key_Escape) { cancelFilter(); return true }
