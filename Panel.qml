@@ -851,9 +851,11 @@ Panel {
         color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.06)
 
         // Width available to the text/progress column: bar minus its own
-        // padding, minus the cover and the gap between them.
+        // padding, minus the cover and the gap between them. The gap only
+        // exists while the cover is visible; otherwise the initial empty
+        // shell state gets an artificial right inset.
         readonly property real contentW:
-          width - Style.space(16 + 16 + 12) - (nowCover.visible ? nowCover.width : 0)
+          width - Style.space(16 + 16) - (nowCover.visible ? nowCover.width + Style.space(12) : 0)
 
         Row {
           id: npRow
@@ -918,7 +920,24 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
                   spacing: Style.space(10)
 
+                  // Current-song tier, using the same glyph semantics as
+                  // track rows. The fixed slot keeps transport controls
+                  // from shifting when a song is unrated.
+                  Item {
+                    visible: root.now && root.now.id
+                    width: Style.space(16)
+                    height: playPauseGlyph.implicitHeight
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    TierGlyph {
+                      anchors.centerIn: parent
+                      tier: root.now && root.now.id ? root.tierOf(root.now.id) : ""
+                      color: tier === "favorite" ? Color.accent : Color.foreground
+                    }
+                  }
+
                   Text {
+                    id: playPauseGlyph
                     textFormat: Text.PlainText
                     text: root.playing ? "󰏤" : "󰐊"
                     color: Color.foreground
