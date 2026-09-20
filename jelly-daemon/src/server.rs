@@ -238,7 +238,7 @@ fn handle_client_msg(
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::PlayAlbum { album_id } => {
-            let _ = cmd_tx.send(AppCommand::PlayAlbum { album_id });
+            let _ = cmd_tx.send(AppCommand::PlayAlbum { album_id, req_id });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::Pause => {
@@ -295,6 +295,22 @@ fn handle_client_msg(
         }
         ClientKind::ToggleFavorite { item_id } => {
             let _ = cmd_tx.send(AppCommand::ToggleFavorite { item_id, req_id });
+            vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
+        }
+        ClientKind::SetTier { item_id, tier } => {
+            let _ = cmd_tx.send(AppCommand::SetTier { item_id, tier, req_id });
+            vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
+        }
+        ClientKind::CycleTier { item_id } => {
+            let _ = cmd_tx.send(AppCommand::CycleTier { item_id, req_id });
+            vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
+        }
+        ClientKind::SetFilter { filter } => {
+            let _ = cmd_tx.send(AppCommand::SetFilter { filter });
+            vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
+        }
+        ClientKind::StepFilter { up } => {
+            let _ = cmd_tx.send(AppCommand::StepFilter { up });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::SetRepeat { mode } => {

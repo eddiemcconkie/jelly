@@ -6,8 +6,10 @@
 
 use anyhow::Context as _;
 use crate::server::BrowseRequest;
+use crate::session::SessionEvent;
 use jelly_ipc::{ClientMessage};
-use jelly_ipc::{ClientKind, ErrorCode, PlaybackSnapshot, PlaybackStatus, RepeatMode, TrackMeta};
+use jelly_ipc::{ClientKind, ErrorCode, PlaybackSnapshot, PlaybackStatus, RepeatMode, Tier, TrackMeta};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -16,7 +18,7 @@ pub enum AppCommand {
     /// The waiting queue survives unless `clear_queue` (queue-tab pick).
     Play { tracks: Vec<TrackMeta>, start_index: usize, clear_queue: bool },
     /// Play an album by id: the daemon fetches its tracks and starts at 0.
-    PlayAlbum { album_id: String },
+    PlayAlbum { album_id: String, req_id: Option<u64> },
     Pause,
     Resume,
     Toggle,
@@ -40,6 +42,18 @@ pub enum AppCommand {
     MoveQueue { index: usize, delta: i32, req_id: Option<u64> },
     /// Toggle the favorite flag on an item; pushes the refreshed set.
     ToggleFavorite { item_id: String, req_id: Option<u64> },
+    /// Set a track's tier (synchronous server write; failure = no change).
+    SetTier { item_id: String, tier: Tier, req_id: Option<u64> },
+    /// Cycle a track's tier from its current value.
+    CycleTier { item_id: String, req_id: Option<u64> },
+    /// Set the global playback filter (walk-time minimum tier).
+    SetFilter { filter: jelly_ipc::TierFilter },
+    /// Step the global filter: up = toward Favorite, down = toward All.
+    StepFilter { up: bool },
+    /// Raw event from the Jellyfin session websocket; the coordinator
+    /// filters by user and applies tier echoes (our writes and edits from
+    /// other devices).
+    SessionEvent(crate::session::SessionEvent),
     /// Re-authenticate using rbw-stored credentials.
     Login,
 }
@@ -48,15 +62,30 @@ pub enum AppCommand {
 fn cmd_title(cmd: &AppCommand) -> String {
     match cmd {
         AppCommand::Play { start_index, .. } => format!("Play@{start_index}"),
-        AppCommand::PlayAlbum { album_id } => format!("PlayAlbum {album_id}"),
+        AppCommand::PlayAlbum { album_id, .. } => format!("PlayAlbum {album_id}"),
         AppCommand::JumpTo { index, .. } => format!("JumpTo@{index}"),
         AppCommand::RemoveFromQueue { index, .. } => format!("Remove@{index}"),
         AppCommand::MoveQueue { index, delta, .. } => format!("Move@{index} {delta:+}"),
         AppCommand::ToggleFavorite { item_id, .. } => format!("Fav {item_id}"),
+        AppCommand::SetTier { item_id, tier, .. } => format!("Tier {item_id} {tier:?}"),
+        AppCommand::CycleTier { item_id, .. } => format!("TierCycle {item_id}"),
+        AppCommand::SessionEvent(SessionEvent::UserDataChanged { entries, .. }) => {
+            format!("SessionEvent UserDataChanged n={}", entries.len())
+        }
+        AppCommand::SessionEvent(SessionEvent::KeepAlive) => "SessionEvent KeepAlive".into(),
         AppCommand::Enqueue { items, .. } => format!("Enqueue n={}", items.len()),
         AppCommand::SetShuffle(on) => format!("Shuffle {on}"),
         AppCommand::SetRepeat(r) => format!("Repeat {r:?}"),
         other => format!("{other:?}"),
+    }
+}
+
+fn filter_label(filter: jelly_ipc::TierFilter) -> &'static str {
+    match filter {
+        jelly_ipc::TierFilter::All => "All",
+        jelly_ipc::TierFilter::Liked => "Liked",
+        jelly_ipc::TierFilter::Loved => "Loved",
+        jelly_ipc::TierFilter::Favorite => "Favorite",
     }
 }
 
@@ -78,6 +107,14 @@ pub struct Coordinator {
     pub model: crate::model::PlaybackModel,
     /// Ids of the user's favorited songs (heart icons).
     pub favorite_ids: Vec<String>,
+    /// Track tiers by item id; only rated entries present. Seeded on
+    /// login, patched by writes and `UserDataChanged` echoes.
+    pub tiers: BTreeMap<String, Tier>,
+    /// The global playback filter applied at walk time (JELLY-40).
+    pub filter: jelly_ipc::TierFilter,
+    /// Publishes the websocket session (token + user) for the session
+    /// listener; `None` parks it (logout / failed login).
+    pub session_tx: tokio::sync::watch::Sender<Option<crate::session::Session>>,
     /// Last observed engine facts (mirrored into snapshots).
     pub position_secs: f64,
     pub duration_secs: Option<f64>,
@@ -110,6 +147,8 @@ impl Coordinator {
             library_rev: crate::state::LIBRARY_REV,
             auth: Some(*self.auth_rx.borrow()),
             favorite_ids: self.favorite_ids.clone(),
+            tiers: self.tiers.clone(),
+            filter: self.filter,
         }
     }
 
@@ -167,8 +206,8 @@ impl Coordinator {
                 let t = self.model.set_context(name, artist, image, tracks, start_index, clear_queue);
                 self.apply(t);
             }
-            AppCommand::PlayAlbum { album_id } => {
-                self.play_album_and_apply(&album_id).await;
+            AppCommand::PlayAlbum { album_id, req_id } => {
+                self.play_album_and_apply(&album_id, req_id).await;
             }
             AppCommand::Pause => {
                 self.engine.send(crate::playback::EngineCommand::Pause);
@@ -184,7 +223,7 @@ impl Coordinator {
                 self.status = PlaybackStatus::Stopped;
             }
             AppCommand::Next => {
-                let t = self.model.next();
+                let t = self.filtered_next();
                 self.apply(t);
             }
             AppCommand::Prev => {
@@ -208,9 +247,19 @@ impl Coordinator {
                 // repeat-all wrap and off/stop are the model's decisions.
                 self.engine
                     .send(crate::playback::EngineCommand::SetLoopFile(mode == RepeatMode::One));
+                self.persist_modes().await;
             }
             AppCommand::SetShuffle(on) => {
                 self.model.set_shuffle(on);
+                self.persist_modes().await;
+            }
+            AppCommand::SetFilter { filter } => {
+                self.filter = filter;
+                self.persist_modes().await;
+            }
+            AppCommand::StepFilter { up } => {
+                self.filter = self.filter.step(up);
+                self.persist_modes().await;
             }
             AppCommand::Enqueue { mut items } => {
                 self.rebuild_stream_urls(&mut items);
@@ -301,8 +350,118 @@ impl Coordinator {
                     }
                 }
             }
+            AppCommand::SetTier { item_id, tier, req_id } => {
+                self.write_tier(&item_id, tier, req_id).await;
+            }
+            AppCommand::CycleTier { item_id, req_id } => {
+                let next = self.tiers.get(&item_id).copied().unwrap_or(Tier::Unrated).next();
+                self.write_tier(&item_id, next, req_id).await;
+            }
+            AppCommand::SessionEvent(ev) => match ev {
+                SessionEvent::UserDataChanged { user_id, entries } => {
+                    // The server scopes pushes to the acting user's own
+                    // sessions; verify before applying (defence in depth).
+                    if self.client.user_id() == Some(user_id.as_str()) {
+                        for entry in entries {
+                            let tier = Tier::from_rating(entry.rating);
+                            self.apply_tier_local(&entry.item_id, tier);
+                        }
+                    }
+                }
+                SessionEvent::KeepAlive => {
+                    // The socket answers it itself; a queued copy is a no-op.
+                }
+            },
         }
         self.push_state(&old).await;
+    }
+
+    /// Local bookkeeping for a tier: presence in the map is the tier
+    /// (unrated = absent), and the heart tracks the Favorite tier.
+    fn apply_tier_local(&mut self, item_id: &str, tier: Tier) {
+        match tier {
+            Tier::Unrated => {
+                self.tiers.remove(item_id);
+            }
+            t => {
+                self.tiers.insert(item_id.to_string(), t);
+            }
+        }
+        let hearted = self.favorite_ids.iter().any(|i| i == item_id);
+        if tier == Tier::Favorite && !hearted {
+            self.favorite_ids.push(item_id.to_string());
+        } else if tier != Tier::Favorite && hearted {
+            self.favorite_ids.retain(|i| i != item_id);
+        }
+    }
+
+    /// Synchronous tier write: on failure nothing changes and the error
+    /// goes back to the requester (no journal, no retry — offline means
+    /// read-only).
+    /// Snapshot of the session modes for persistence.
+    fn current_modes(&self) -> crate::modes::Modes {
+        crate::modes::Modes {
+            shuffle: self.model.shuffle,
+            repeat: self.model.repeat,
+            filter: self.filter,
+        }
+    }
+
+    async fn persist_modes(&self) {
+        crate::modes::save(&self.current_modes()).await;
+    }
+
+    /// Restore shuffle/repeat/filter at daemon startup (shell reload).
+    /// No context exists yet, so this is pure state + one engine flag.
+    pub async fn apply_startup_modes(&mut self) {
+        let m = crate::modes::load().await;
+        self.filter = m.filter;
+        self.model.repeat = m.repeat;
+        if m.repeat == RepeatMode::One {
+            self.engine
+                .send(crate::playback::EngineCommand::SetLoopFile(true));
+        }
+        self.model.set_shuffle(m.shuffle);
+        if m != crate::modes::Modes::default() {
+            tracing::info!("restored modes: {m:?}");
+        }
+    }
+
+    /// Filtered context advance (manual next AND natural end-of-track):
+    /// field-destructured so the predicate borrows `tiers`/`filter`
+    /// while the model walks mutably. Queue consumption and all walk
+    /// semantics live in `PlaybackModel::next_with` (tested there).
+    fn filtered_next(&mut self) -> crate::model::Transition {
+        let Self { model, filter, tiers, .. } = self;
+        model.next_with(&|t: &TrackMeta| {
+            let tier = tiers.get(&t.id).copied().unwrap_or(Tier::Unrated);
+            filter.passes(tier)
+        })
+    }
+
+    async fn write_tier(&mut self, item_id: &str, tier: Tier, req_id: Option<u64>) {
+        if !self.client.is_authenticated() {
+            let _ = self.broadcast_tx.send(DaemonMessage::new(
+                DaemonKind::Error {
+                    code: ErrorCode::NotAuthenticated,
+                    message: "tiers need an authenticated session".into(),
+                },
+                req_id,
+            ));
+            return;
+        }
+        match self.client.set_tier(item_id, tier).await {
+            Ok(()) => self.apply_tier_local(item_id, tier),
+            Err(e) => {
+                let _ = self.broadcast_tx.send(DaemonMessage::new(
+                    DaemonKind::Error {
+                        code: ErrorCode::Internal,
+                        message: format!("tier write failed: {e:#}"),
+                    },
+                    req_id,
+                ));
+            }
+        }
     }
 
     /// Fill in direct-play stream URLs from item ids (the client never
@@ -324,7 +483,7 @@ impl Coordinator {
     /// Play an album by id without the client having its track list:
     /// fetch the album item (for context name/cover) and its tracks, then
     /// hand them to the normal Play path.
-    async fn play_album_and_apply(&mut self, album_id: &str) {
+    async fn play_album_and_apply(&mut self, album_id: &str, req_id: Option<u64>) {
         if !self.client.is_authenticated() {
             tracing::warn!("play_album before authentication; send login first");
             return;
@@ -361,13 +520,33 @@ impl Coordinator {
             tracing::warn!("play_album: album {album_id} returned no tracks");
             return;
         }
+        let start_index = if self.filter == jelly_ipc::TierFilter::All {
+            0
+        } else {
+            match tracks.iter().position(|t| {
+                let tier = self.tiers.get(&t.id).copied().unwrap_or(Tier::Unrated);
+                self.filter.passes(tier)
+            }) {
+                Some(i) => i,
+                None => {
+                    let _ = self.broadcast_tx.send(DaemonMessage::new(
+                        DaemonKind::Error {
+                            code: ErrorCode::BadMessage,
+                            message: format!("no {} tracks", filter_label(self.filter)),
+                        },
+                        req_id,
+                    ));
+                    return;
+                }
+            }
+        };
         let mut tracks = tracks;
         self.rebuild_stream_urls(&mut tracks);
         let name = album.name.clone();
-        let artist = tracks[0].artist.clone();
+        let artist = tracks[start_index].artist.clone();
         let t = self
             .model
-            .set_context(name, artist, self.client.image_url(&album), tracks, 0, false);
+            .set_context(name, artist, self.client.image_url(&album), tracks, start_index, false);
         self.apply(t);
     }
 
@@ -432,6 +611,8 @@ impl Coordinator {
 
     async fn login(&mut self) {
         let old = self.build_snapshot();
+        // Park the session socket while we sort out credentials.
+        let _ = self.session_tx.send(None);
         // Session cache first: no rbw round-trip (and no pinentry risk)
         // when this is a daemon restart within the same login session.
         if let Some(cached) = crate::rbw::cached_credentials() {
@@ -443,10 +624,7 @@ impl Coordinator {
                 Ok(_) => {
                     tracing::info!("authenticated as {} (cached credentials)", cached.username);
                     let _ = self.auth_tx.send(AuthStatus::Authenticated);
-                    match self.client.favorite_ids().await {
-                        Ok(ids) => self.favorite_ids = ids,
-                        Err(e) => tracing::warn!("favorite fetch failed: {e:#}"),
-                    }
+                    self.refresh_user_state().await;
                     self.push_state(&old).await;
                     return;
                 }
@@ -473,11 +651,7 @@ impl Coordinator {
                         username: username.clone(),
                         password,
                     });
-                    // Refresh the favorite set for the heart icons.
-                    match self.client.favorite_ids().await {
-                        Ok(ids) => self.favorite_ids = ids,
-                        Err(e) => tracing::warn!("favorite fetch failed: {e:#}"),
-                    }
+                    self.refresh_user_state().await;
                 }
                 Err(e) => {
                     tracing::warn!("login failed: {e:#}");
@@ -490,6 +664,21 @@ impl Coordinator {
             }
         }
         self.push_state(&old).await;
+    }
+
+    /// After a successful login: pull the authoritative favorite set and
+    /// tier map, then publish the session for the UserDataChanged socket.
+    async fn refresh_user_state(&mut self) {
+        match self.client.favorite_ids().await {
+            Ok(ids) => self.favorite_ids = ids,
+            Err(e) => tracing::warn!("favorite fetch failed: {e:#}"),
+        }
+        match self.client.tier_map().await {
+            Ok(map) => self.tiers = map,
+            Err(e) => tracing::warn!("tier fetch failed: {e:#}"),
+        }
+        let session = self.client.session(&self.server_url);
+        let _ = self.session_tx.send(session);
     }
 
     /// Poll until the agent unlocks (user completes pinentry), then re-login.
@@ -547,8 +736,9 @@ impl Coordinator {
             }
             crate::playback::EngineEvent::TrackEnded => {
                 // The model owns the transition (queue head, context walk,
-                // wrap, stop). Repeat-one never gets here (loop-file).
-                let t = self.model.track_ended();
+                // wrap, stop) under the active tier filter. Repeat-one
+                // never gets here (loop-file).
+                let t = self.filtered_next();
                 self.apply(t);
             }
         }

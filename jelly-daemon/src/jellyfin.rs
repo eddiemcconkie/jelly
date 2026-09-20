@@ -60,7 +60,7 @@ pub struct MediaItem {
     #[serde(rename = "MediaSources", default)]
     pub media_sources: Option<Vec<MediaSource>>,
     #[serde(rename = "UserData", default)]
-    pub user_data: Option<UserData>,
+    user_data: Option<UserData>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -88,6 +88,21 @@ pub struct ItemsResponse {
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 struct UserData {
+    is_favorite: Option<bool>,
+    #[serde(default)]
+    rating: Option<f64>,
+}
+
+/// Body of `POST /Users/{uid}/Items/{id}/UserData` (10.11 semantics:
+/// every present field is applied, absent fields are untouched — so
+/// `rating` is only ever `Some` here; clearing goes via the Rating
+/// DELETE route instead).
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "PascalCase")]
+struct UpdateUserItemData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rating: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     is_favorite: Option<bool>,
 }
 
@@ -121,6 +136,16 @@ impl JellyfinClient {
 
     pub fn user_id(&self) -> Option<&str> {
         self.user_id.as_deref()
+    }
+
+    /// Credentials for the session websocket, once authenticated.
+    pub fn session(&self, server_url: &str) -> Option<crate::session::Session> {
+        let token = self.token.as_ref()?;
+        let user_id = self.user_id.as_ref()?;
+        Some(crate::session::Session {
+            ws_url: crate::session::ws_url(server_url, token),
+            user_id: user_id.clone(),
+        })
     }
 
     /// `Authorization: MediaBrowser Client=..., Token=...` convention.
@@ -175,6 +200,37 @@ impl JellyfinClient {
         Ok(resp.json().await.with_context(|| format!("bad JSON from {path}"))?)
     }
 
+    async fn post_json<B: Serialize + ?Sized>(&self, path: &str, body: &B) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {path} failed"))?;
+        if !resp.status().is_success() {
+            anyhow::bail!("POST {path}: HTTP {}", resp.status());
+        }
+        Ok(())
+    }
+
+    async fn delete_json(&self, path: &str) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .with_context(|| format!("DELETE {path} failed"))?;
+        if !resp.status().is_success() {
+            anyhow::bail!("DELETE {path}: HTTP {}", resp.status());
+        }
+        Ok(())
+    }
+
     /// Direct-play URL. Auth rides in the query string because mpv fetches
     /// this URL itself and cannot send our header.
     pub fn stream_url(&self, item_id: &str) -> Option<String> {
@@ -227,6 +283,66 @@ impl JellyfinClient {
             )
             .await?;
         Ok(resp.items.into_iter().map(|i| i.id).collect())
+    }
+
+    /// Persist a track tier: one UserData write sets rating + favorite
+    /// flag (Favorite hearts the item, every other tier unhearts it).
+    /// Unrated uses DELETE Rating — the update DTO can set ratings but
+    /// never clear them, while DELETE maps likes=null to rating=null.
+    pub async fn set_tier(&self, item_id: &str, tier: jelly_ipc::Tier) -> Result<()> {
+        let user_id = self.user_id.as_deref().context("not authenticated")?;
+        let path = format!("/Users/{user_id}/Items/{item_id}/UserData");
+        match tier.rating() {
+            Some(rating) => {
+                self.post_json(
+                    &path,
+                    &UpdateUserItemData {
+                        rating: Some(rating),
+                        is_favorite: Some(tier == jelly_ipc::Tier::Favorite),
+                    },
+                )
+                .await
+            }
+            None => {
+                self.post_json(
+                    &path,
+                    &UpdateUserItemData {
+                        rating: None,
+                        is_favorite: Some(false),
+                    },
+                )
+                .await?;
+                self.delete_json(&format!(
+                    "/Users/{user_id}/Items/{item_id}/Rating"
+                ))
+                .await
+            }
+        }
+    }
+
+    /// Every rated audio item as (id, tier) — the tier map seed. Unrated
+    /// items are absent; a personal library's scores are a small subset.
+    pub async fn tier_map(&self) -> Result<std::collections::BTreeMap<String, jelly_ipc::Tier>> {
+        let user_id = self.user_id.as_deref().context("not authenticated")?;
+        let resp: ItemsResponse = self
+            .get_json(
+                &format!("/Users/{user_id}/Items"),
+                &[
+                    ("includeItemTypes", "Audio"),
+                    ("recursive", "true"),
+                    ("enableUserData", "true"),
+                    ("limit", "100000"),
+                ],
+            )
+            .await?;
+        Ok(resp
+            .items
+            .iter()
+            .filter_map(|i| {
+                let rating = i.user_data.as_ref()?.rating?;
+                Some((i.id.clone(), jelly_ipc::Tier::from_rating(Some(rating))))
+            })
+            .collect())
     }
 
     pub fn image_url(&self, item: &MediaItem) -> Option<String> {
@@ -358,6 +474,30 @@ pub fn browse_item_from(item: &MediaItem, image_url: Option<String>) -> BrowseIt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_data_body_omits_absent_fields() {
+        // 10.11 applies exactly the fields present in the DTO.
+        let b = UpdateUserItemData { rating: None, is_favorite: Some(false) };
+        assert_eq!(serde_json::to_string(&b).unwrap(), r#"{"IsFavorite":false}"#);
+        let b = UpdateUserItemData { rating: Some(8.0), is_favorite: Some(false) };
+        assert_eq!(
+            serde_json::to_string(&b).unwrap(),
+            r#"{"Rating":8.0,"IsFavorite":false}"#
+        );
+    }
+
+    #[test]
+    fn media_item_reads_rating_from_user_data() {
+        let item: MediaItem = serde_json::from_str(
+            r#"{"Id":"x","Name":"T","UserData":{"IsFavorite":false,"Rating":9.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(item.user_data.unwrap().rating, Some(9.0));
+        let item: MediaItem =
+            serde_json::from_str(r#"{"Id":"x","Name":"T","UserData":{"Rating":null}}"#).unwrap();
+        assert_eq!(item.user_data.unwrap().rating, None);
+    }
 
     #[test]
     fn auth_header_shape() {

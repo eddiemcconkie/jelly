@@ -122,8 +122,22 @@ impl PlaybackModel {
         }
     }
 
-    /// Advance: queue head first, then context order (+1 / wrap).
+    /// Advance: queue head first (never filtered — queued songs were
+    /// added by hand), then walk the context to the next track passing
+    /// the predicate. The plain form plays every track.
     pub fn next(&mut self) -> Transition {
+        self.next_with(&|_| true)
+    }
+
+    /// Filter-aware advance. `pass` is consulted per candidate, so a
+    /// tier filter (or any predicate) skips non-matching tracks AT WALK
+    /// TIME — contexts are never rewritten. Semantics:
+    /// - repeat-all wraps the search from the top of the lap;
+    /// - repeat-off ends at the tail: "album ends early" when nothing
+    ///   ahead passes is correct, not a bug;
+    /// - nothing passing anywhere stops cleanly (no spinning);
+    /// - the current track is never re-considered on this step.
+    pub fn next_with(&mut self, pass: &dyn Fn(&TrackMeta) -> bool) -> Transition {
         if !self.queue.is_empty() {
             let head = self.queue.remove(0);
             self.head = Some(head.clone());
@@ -134,23 +148,29 @@ impl PlaybackModel {
         };
         // Leaving the queue (if we were in it) for the context.
         self.head = None;
-        let next_pos = match ctx.pos {
-            Some(p) => p + 1,
-            // Fresh context that was loaded paused/stopped: start at top.
-            None => 0,
-        };
-        let next_pos = if next_pos >= ctx.order.len() {
-            match self.repeat {
-                RepeatMode::All => 0,
-                _ => return Transition::Stop,
+        let len = ctx.order.len();
+        if len == 0 {
+            return Transition::Stop;
+        }
+        let start = ctx.pos.map(|p| p + 1).unwrap_or(0);
+        let wrap = self.repeat == RepeatMode::All;
+        if start >= len && !wrap {
+            return Transition::Stop;
+        }
+        let span = if wrap { len } else { len - start };
+        let found = (0..span).find(|&k| {
+            ctx.track_at((start + k) % len).is_some_and(|t| pass(t))
+        });
+        match found {
+            Some(k) => {
+                let next_pos = (start + k) % len;
+                ctx.pos = Some(next_pos);
+                self.last_context_pos = Some(next_pos);
+                match ctx.track_at(next_pos) {
+                    Some(t) => Transition::Play(t.clone()),
+                    None => Transition::Stop,
+                }
             }
-        } else {
-            next_pos
-        };
-        ctx.pos = Some(next_pos);
-        self.last_context_pos = Some(next_pos);
-        match ctx.track_at(next_pos) {
-            Some(t) => Transition::Play(t.clone()),
             None => Transition::Stop,
         }
     }
@@ -211,7 +231,12 @@ impl PlaybackModel {
     /// tree as `next`, except repeat-one owns the transition natively in
     /// the engine (loop-file), so we never see EOF in that mode.
     pub fn track_ended(&mut self) -> Transition {
-        self.next()
+        self.next_with(&|_| true)
+    }
+
+    /// EOF with the active playback filter applied (coordinator path).
+    pub fn track_ended_with(&mut self, pass: &dyn Fn(&TrackMeta) -> bool) -> Transition {
+        self.next_with(pass)
     }
 
     /// Toggle shuffle. Turning it on means "play every song shuffled,
@@ -403,11 +428,103 @@ mod tests {
     }
 
     #[test]
-    fn next_walks_context_then_stops() {
+    fn next_plain_walks_context_then_stops() {
         let (mut m, _) = model(&["1", "2", "3"], 0);
         assert_eq!(m.next(), Transition::Play(track("2")));
         assert_eq!(m.next(), Transition::Play(track("3")));
         assert_eq!(m.next(), Transition::Stop);
+    }
+
+    // ---- walk-predicate (tier filter) semantics, JELLY-40 ----
+
+    fn only<S: AsRef<str>>(ids: &[S]) -> impl Fn(&TrackMeta) -> bool + 'static {
+        let owned: Vec<String> = ids.iter().map(|s| s.as_ref().to_string()).collect();
+        move |t| owned.iter().any(|i| i == &t.id)
+    }
+
+    #[test]
+    fn next_with_skips_non_matching_forward() {
+        let (mut m, _) = model(&["1", "2", "3", "4"], 0);
+        // Only "3" and "4" pass: from pos 0 the walk jumps over "2".
+        assert_eq!(m.next_with(&only(&["3", "4"])), Transition::Play(track("3")));
+        assert_eq!(m.context.as_ref().unwrap().pos, Some(2));
+        assert_eq!(m.next_with(&only(&["3", "4"])), Transition::Play(track("4")));
+    }
+
+    #[test]
+    fn next_with_ends_early_when_nothing_ahead_passes() {
+        let (mut m, _) = model(&["1", "2", "3"], 0);
+        // "2" would play next unfiltered, but only "1" (behind us) passes.
+        assert_eq!(m.next_with(&only(&["1"])), Transition::Stop);
+        // Position untouched: stopping early is not rewinding.
+        assert_eq!(m.context.as_ref().unwrap().pos, Some(0));
+    }
+
+    #[test]
+    fn next_with_repeat_all_wraps_to_a_passing_song_behind() {
+        let (mut m, _) = model(&["1", "2", "3"], 0);
+        m.repeat = RepeatMode::All;
+        // Nothing ahead passes; wrap finds "1" (the lap's start again).
+        assert_eq!(m.next_with(&only(&["1"])), Transition::Play(track("1")));
+    }
+
+    #[test]
+    fn next_with_nothing_passing_anywhere_stops() {
+        for repeat in [RepeatMode::Off, RepeatMode::All] {
+            let (mut m, _) = model(&["1", "2", "3"], 0);
+            m.repeat = repeat;
+            assert_eq!(m.next_with(&only::<&str>(&[])), Transition::Stop);
+        }
+    }
+
+    #[test]
+    fn queue_songs_are_exempt_from_the_filter() {
+        let (mut m, _) = model(&["1", "2"], 0);
+        m.enqueue(vec![track("q1")]);
+        // Predicate admits nothing in the context; the queue still plays.
+        assert_eq!(m.next_with(&only::<&str>(&[])), Transition::Play(track("q1")));
+        // Then continuation into the context applies the predicate.
+        assert_eq!(m.next_with(&only::<&str>(&[])), Transition::Stop);
+    }
+
+    #[test]
+    fn prev_is_unfiltered_history_navigation() {
+        let (mut m, _) = model(&["1", "2", "3"], 0);
+        assert_eq!(m.next_with(&only(&["3"])), Transition::Play(track("3")));
+        // Prev steps back onto "2" even though it failed the filter:
+        // rewinding revisits skipped songs, not the last-played matches.
+        assert_eq!(m.prev(2.0), Transition::Play(track("2")));
+    }
+
+    #[test]
+    fn next_with_shuffles_within_the_permutation() {
+        // Admit only the two shuffled songs that follow the current one:
+        // they must arrive in permutation order, not original order.
+        let (mut m, _) = model(&["1", "2", "3", "4", "5"], 0);
+        m.set_shuffle(true);
+        let passes: Vec<String> = m
+            .context
+            .as_ref()
+            .unwrap()
+            .order
+            .iter()
+            .skip(1)
+            .take(2)
+            .map(|&i| m.context.as_ref().unwrap().tracks[i].id.clone())
+            .collect();
+        let first = m.next_with(&only(&passes)).unwrap_play();
+        assert_eq!(first.id, passes[0]);
+        let second = m.next_with(&only(&passes)).unwrap_play();
+        assert_eq!(second.id, passes[1]);
+    }
+
+    impl Transition {
+        fn unwrap_play(self) -> TrackMeta {
+            match self {
+                Transition::Play(t) => t,
+                other => panic!("expected Play, got {other:?}"),
+            }
+        }
     }
 
     #[test]

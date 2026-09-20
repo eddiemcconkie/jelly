@@ -261,6 +261,7 @@ Panel {
             if (msg.type === "state") {
               root.snap = msg
               root.position = msg.position_secs || 0
+              if (msg.context) root.pendingAlbumPlayRaw = ""
               console.info("jelly: state push: ctx", msg.context ? ((msg.context.tracks || []).length + " tracks") : "NONE",
                            "q", (msg.queue || []).length, "shuffle", msg.shuffle,
                            "cur", msg.context ? msg.context.current_index : "?")
@@ -270,6 +271,10 @@ Panel {
               root.onBrowse(msg)
             } else if (msg.type === "error") {
               console.warn("jelly daemon error:", msg.message)
+              if (root.pendingAlbumPlayRaw !== "" && (msg.message || "").indexOf("no ") === 0) {
+                root.flashRow(root.pendingAlbumPlayRaw, msg.message)
+                root.pendingAlbumPlayRaw = ""
+              }
             }
           } catch (e) { console.warn("jelly: bad line", e) }
         }
@@ -351,6 +356,7 @@ Panel {
 
   // Transient feedback for row actions.
   property var rowFlash: null
+  property string pendingAlbumPlayRaw: ""
   Timer { id: rowFlashTimer; interval: 1400; onTriggered: root.rowFlash = null }
 
   function albumMetas(al) {
@@ -371,7 +377,7 @@ Panel {
                    artist: q.artist || "", durationSecs: q.duration_secs || null,
                    sub: (q.artist || "") + (q.duration_secs ? "  ·  " + Util.fmt(q.duration_secs) : ""),
                    cover: coverByAlbum(q.album) || coverForTrackId(q.id) || q.image_url || "",
-                   showCover: true, showGlyph: false, showFav: true, playing: false,
+                   showCover: true, showGlyph: false, playing: false,
                    section: "" })
       }
       var ctx = snap.context
@@ -383,21 +389,23 @@ Panel {
                    artist: t.artist || "", durationSecs: t.duration_secs || null,
                    title: t.name,
                    sub: (t.artist || "") + (t.duration_secs ? "  ·  " + Util.fmt(t.duration_secs) : ""),
-                   cover: (ctx.image_url || ""), showCover: true, showGlyph: false, showFav: true,
+                   cover: (ctx.image_url || ""), showCover: true, showGlyph: false,
                    playing: t.id === root.now.id && !root.snap.queue_head,
                    section: sectionName }
         }
         // Remaining tracks only (the playing track is the now-playing
-        // bar, not a row)...
-        for (var j = cur + 1; j < tracks.length; j++) out.push(ctxRow(tracks[j], j, ctx.name))
+        // bar, not a row), display-filtered by the active tier: rows the
+        // walk would skip are hidden (the daemon's context still holds
+        // them). Waiting-queue rows above are exempt — never filtered.
+        for (var j = cur + 1; j < tracks.length; j++)
+          if (root.filterPasses(tracks[j].id)) out.push(ctxRow(tracks[j], j, ctx.name))
         // ...then, under repeat-all, the already-played ones wrap around,
         // in their own section so the wrap point is visible.
         if (snap.repeat === "all" && cur > 0) {
           // The already-played tracks wrap around; the current song is not
           // repeated here (it is what plays next).
-          for (var k = 0; k < cur && k < tracks.length; k++) {
-            out.push(ctxRow(tracks[k], k, ctx.name))
-          }
+          for (var k = 0; k < cur && k < tracks.length; k++)
+            if (root.filterPasses(tracks[k].id)) out.push(ctxRow(tracks[k], k, ctx.name))
         }
       }
       return out
@@ -448,6 +456,7 @@ Panel {
         // Enter plays the album from the start (the daemon's shuffle
         // order applies from there); l opens it. The daemon fetches the
         // album's track list itself: the widget never needs it for this.
+        pendingAlbumPlayRaw = item.raw
         send({ type: "play_album", album_id: item.albumId })
         return
       }
@@ -474,13 +483,22 @@ Panel {
   }
 
   // Guard rails for row actions: duplicate-queue guard, offline
-  // guard for favorites, and a transient message on the acted-on row.
+  // guard for tiers, and a transient message on the acted-on row.
   function rowAction(action, item) {
     if (!item || !item.trackId) return
-    if (action === "favorite") {
-      if (!connected) { flashRow(item.raw, "offline — favorites need a daemon connection"); return }
-      send({ type: "toggle_favorite", item_id: item.trackId })
-      flashRow(item.raw, favSet[item.trackId] ? "unfavorited" : "favorited")
+    if (action === "tier") {
+      if (!connected) { flashRow(item.raw, "offline — tiers need a daemon connection"); return }
+      // Queue-tab CONTEXT rows are display-filtered: cycling one below
+      // the filter would evict the row under the cursor. Tier editing
+      // belongs in the album view, where every row is always visible.
+      // (Waiting-queue rows are exempt — they never hide.)
+      if (tab === "queue" && item.ctxIndex !== undefined && item.queueIndex === undefined) {
+        flashRow(item.raw, "tiers: edit in the album view")
+        return
+      }
+      var next = Util.tierNext(tierMap[item.trackId] || "")
+      send({ type: "cycle_tier", item_id: item.trackId })
+      flashRow(item.raw, next === "" ? "unrated" : next)
       return
     }
     if (queuedIds()[item.trackId]) { flashRow(item.raw, "already queued"); return }
@@ -509,7 +527,7 @@ Panel {
     if (!item) return false
     if (t === "q") { rowAction("queue", item); return true }
     if (t === "p") { rowAction("next", item); return true }
-    if (t === "f") { rowAction("favorite", item); return true }
+    if (t === "f") { rowAction("tier", item); return true }
     var inQueue = item.queueIndex !== undefined && item.queueIndex !== null
     if (t === "d" && inQueue) {
       send({ type: "remove_from_queue", index: item.queueIndex }); return true
@@ -612,8 +630,10 @@ Panel {
     { key: "d", desc: "Remove selected queue item" },
     { key: "J", desc: "Move queue item down" },
     { key: "K", desc: "Move queue item up" },
-    { key: "f", desc: "Toggle favorite on selection" },
-    { key: "F", desc: "Toggle favorite on playing song" },
+    { key: "f", desc: "Cycle tier on selection" },
+    { key: "F", desc: "Cycle tier on playing song" },
+    { key: "[", desc: "Step playback filter down (toward All)" },
+    { key: "]", desc: "Step playback filter up (toward Favorite)" },
     { key: "s", desc: "Toggle shuffle" },
     { key: "r", desc: "Cycle repeat off / all / one" },
     { key: "n", desc: "Next track" },
@@ -675,27 +695,35 @@ Panel {
     return ids
   }
 
-  // ---- favorites. The daemon pushes the full favorite-id set on login
-  //      and after every toggle.
-  readonly property var favSet: {
-    var m = {}
-    var ids = snap.favorite_ids || []
-    for (var i = 0; i < ids.length; i++) m[ids[i]] = true
-    return m
+  // ---- tiers. The daemon pushes the rated-track map (id -> tier) on
+  //      every state change; unrated tracks are absent. IsFavorite is
+  //      write-side only (Favorite tier hearts the item for other
+  //      clients) — nothing in this UI renders favorites.
+  readonly property var tierMap: snap.tiers || ({})
+
+  // ---- playback filter (JELLY-40). The daemon walks contexts with this
+  //      minimum tier; the panel uses it only for display filtering.
+  readonly property string snapFilter: snap.filter || "all"
+
+  function tierOf(id) { return (root.tierMap[id] || "unrated").toString().toLowerCase() }
+  function tierRank(tier) {
+    var t = (tier || "unrated").toString().toLowerCase()
+    if (t === "liked") return 1
+    if (t === "loved") return 2
+    if (t === "favorite") return 3
+    return 0
+  }
+  function filterPasses(id) {
+    if (root.snapFilter === "all") return true
+    // Inclusive threshold: Liked shows Liked/Loved/Favorite, Loved shows
+    // Loved/Favorite, Favorite shows only Favorite.
+    return root.tierRank(root.tierOf(id)) >= root.tierRank(root.snapFilter)
   }
 
-  function toggleFavoriteId(id, flashRaw) {
-    if (!id) return
-    if (!connected) {
-      if (flashRaw !== undefined) flashRow(flashRaw, "offline — favorites need a daemon connection")
-      return
-    }
-    send({ type: "toggle_favorite", item_id: id })
-    if (flashRaw !== undefined) flashRow(flashRaw, favSet[id] ? "unfavorited" : "favorited")
-  }
-
-  function toggleFavoriteNow() {
-    toggleFavoriteId(now.id, undefined)
+  function cycleTierNow() {
+    if (!now || !now.id) return
+    if (!connected) return
+    send({ type: "cycle_tier", item_id: now.id })
   }
 
   function open() { controller.show() }
@@ -802,7 +830,9 @@ Panel {
         if (t === "N") { root.prevTrack(); event.accepted = true; return }
         if (t === "," && !event.isAutoRepeat) { root.seekBy(-10); event.accepted = true; return }
         if (t === "." && !event.isAutoRepeat) { root.seekBy(10); event.accepted = true; return }
-        if (t === "F") { root.toggleFavoriteNow(); event.accepted = true; return }
+        if (t === "F") { root.cycleTierNow(); event.accepted = true; return }
+        if (t === "[") { send({ type: "step_filter", up: false }); event.accepted = true; return }
+        if (t === "]") { send({ type: "step_filter", up: true }); event.accepted = true; return }
         if (t === "?") { root.openPalette(); event.accepted = true; return }
         if (t === "H") { root.cycleTab(-1); event.accepted = true; return }
         if (t === "L") { root.cycleTab(1); event.accepted = true; return }
@@ -957,36 +987,66 @@ Panel {
 
 
       // Tabs. Filtering belongs to List, so this row is always stable.
-      Row {
+      // The tier-filter triptych rides the far right, fixed across tabs:
+      // the ACCENTED icon is the active playback filter, all-dim = All.
+      // (Track-row tier opacity intentionally overridden to full here —
+      // unaccented must read dim, not quiet-by-tier.)
+      Item {
         id: tabsRow
+        width: parent ? parent.width : 0
         height: Style.space(30)
-        leftPadding: Style.space(16)
-        rightPadding: Style.space(16)
-        spacing: Style.space(10)
 
-        Repeater {
-          model: [ { id: "queue", label: "󰐑 Queue" },
-                    { id: "albums", label: "󰀥 Albums" },
-                    { id: "commands", label: "Commands" } ]
+        Row {
+          id: tabsInner
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          leftPadding: Style.space(16)
+          rightPadding: Style.space(16)
+          spacing: Style.space(10)
 
-          delegate: Rectangle {
-            required property var modelData
-            readonly property bool active: root.tab === modelData.id
-            anchors.verticalCenter: parent.verticalCenter
-            width: tabLabel.implicitWidth + Style.space(14)
-            height: tabLabel.implicitHeight + Style.space(6)
-            radius: Style.cornerRadius
-            color: active ? Color.accent : "transparent"
+          Repeater {
+            model: [ { id: "queue", label: "󰐑 Queue" },
+                      { id: "albums", label: "󰀥 Albums" },
+                      { id: "commands", label: "Commands" } ]
 
-            Text {
-              id: tabLabel
-              anchors.centerIn: parent
-              textFormat: Text.PlainText
-              text: parent.modelData.label
-              color: parent.active ? Color.background : Color.foreground
-              font.family: Style.font.family
+            delegate: Rectangle {
+              required property var modelData
+              readonly property bool active: root.tab === modelData.id
+              anchors.verticalCenter: parent.verticalCenter
+              width: tabLabel.implicitWidth + Style.space(14)
+              height: tabLabel.implicitHeight + Style.space(6)
+              radius: Style.cornerRadius
+              color: active ? Color.accent : "transparent"
+
+              Text {
+                id: tabLabel
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: parent.modelData.label
+                color: parent.active ? Color.background : Color.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                font.bold: parent.active
+              }
+            }
+          }
+        }
+
+        Row {
+          id: filterTriptych
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          rightPadding: Style.space(16)
+          spacing: Style.space(6)
+
+          Repeater {
+            model: [ "liked", "loved", "favorite" ]
+            delegate: TierGlyph {
+              required property string modelData
+              tier: modelData
+              opacity: 1.0
+              color: root.snapFilter === modelData ? Color.accent : Qt.darker(Color.foreground, 2.2)
               font.pixelSize: Style.font.body
-              font.bold: parent.active
             }
           }
         }
@@ -1049,7 +1109,7 @@ Panel {
         secHeight: root.tab === "queue" ? Style.space(28) : Style.space(56)
         reversed: false
         flash: root.rowFlash
-        favSet: root.favSet
+        tierMap: root.tierMap
         headerComponent: root.tab === "queue"
           ? (root.snap.queue && root.snap.queue.length > 0 ? queueHeaderComp : null)
           : (root.tab === "albums" && root.openAlbumId !== "" ? headerComp : null)

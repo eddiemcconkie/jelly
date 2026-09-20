@@ -1,11 +1,13 @@
 //! jctl: tiny CLI for poking the jelly daemon socket.
 //!
 //! Usage: jctl [COMMAND]...   (e.g. `jctl play <track-id>`, `jctl artists`,
-//! `jctl enqueue <id>...`, `jctl jump 2`, `jctl repeat all`, `jctl state`)
+//! `jctl enqueue <id>...`, `jctl jump 2`, `jctl repeat all`, `jctl state`,
+//! `jctl tier <id> liked|loved|favorite|unrated`, `jctl tiercycle <id>`,
+//! `jctl filter all|liked|loved|favorite`, `jctl filterstep up|down`)
 //! Commands mirror ClientKind; unknown words are sent raw as JSON.
 
 use jelly_ipc::{
-    ClientKind, ClientMessage, DaemonMessage, RepeatMode, TrackMeta,
+    ClientKind, ClientMessage, DaemonMessage, RepeatMode, Tier, TierFilter, TrackMeta,
 };
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
@@ -137,6 +139,41 @@ fn build_message(args: &[String]) -> (ClientKind, Option<u64>) {
         Some("fav") => (
             K::ToggleFavorite {
                 item_id: args.get(1).cloned().unwrap_or_default(),
+            },
+            req_id,
+        ),
+        Some("tier") => (
+            K::SetTier {
+                item_id: args.get(1).cloned().unwrap_or_default(),
+                tier: match args.get(2).map(String::as_str) {
+                    Some("liked") => Tier::Liked,
+                    Some("loved") => Tier::Loved,
+                    Some("favorite") => Tier::Favorite,
+                    _ => Tier::Unrated,
+                },
+            },
+            req_id,
+        ),
+        Some("tiercycle") => (
+            K::CycleTier {
+                item_id: args.get(1).cloned().unwrap_or_default(),
+            },
+            req_id,
+        ),
+        Some("filter") => (
+            K::SetFilter {
+                filter: match args.get(1).map(String::as_str) {
+                    Some("liked") => TierFilter::Liked,
+                    Some("loved") => TierFilter::Loved,
+                    Some("favorite") => TierFilter::Favorite,
+                    _ => TierFilter::All,
+                },
+            },
+            req_id,
+        ),
+        Some("filterstep") => (
+            K::StepFilter {
+                up: args.get(1).map(String::as_str) == Some("up"),
             },
             req_id,
         ),

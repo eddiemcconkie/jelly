@@ -14,7 +14,7 @@ Item {
   property int index: -1
   property bool isCursor: false
   // Unused for command rows; present so the shared Bindings stay silent.
-  property bool isFav: false
+  property string tier: ""
   property string flashText: ""
 
   width: parent ? parent.width : 0

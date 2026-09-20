@@ -1,6 +1,5 @@
 // The one row delegate shared by every list. The variants (cover or not,
-// variants (cover or not, play glyph, heart, indent) are data on the row,
-// not separate components.
+// play glyph, tier, indent) are data on the row, not separate components.
 //
 // Layout is implicit: a RowLayout with spacing/padding sizes the row, and
 // the row's height derives from it. Only media (the cover) is fixed, so
@@ -18,7 +17,7 @@ Item {
   property var modelData: null
   property int index: -1
   property bool isCursor: false
-  property bool isFav: false
+  property string tier: ""
   property string flashText: ""
 
   readonly property var md: modelData || ({})
@@ -27,8 +26,6 @@ Item {
   // A row only reserves space for what it is meant to show.
   readonly property bool showCover: md.showCover === true
   readonly property bool showGlyph: md.showGlyph === true
-  // Favorite heart: only on song rows that opt in (showFav).
-  readonly property bool showFav: md.showFav === true && md.trackId !== undefined
 
   // Fixed media size; everything else adapts to it.
   readonly property real coverSize: Style.space(44)
@@ -45,7 +42,7 @@ Item {
   implicitHeight: rowHeight
   height: rowHeight
 
-  // Section header row: only the bold caption — no cover, glyph, heart
+  // Section header row: only the bold caption — no cover, glyph, tier
   // or title row underneath. Aligned to the BOTTOM of the row: the text
   // sits next to its section, and the space above separates it from the
   // previous one.
@@ -68,41 +65,8 @@ Item {
     color: row2.isCursor ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.18) : "transparent"
   }
 
-  // Favorite heart: filled + accent when favorited (always); the empty
-  // outline only appears on the cursor row, to keep the list quiet.
-  Text {
-    visible: row2.showFav && (row2.isFav || row2.isCursor)
-    anchors.right: parent.right
-    anchors.rightMargin: Style.space(12)
-    anchors.verticalCenter: parent.verticalCenter
-    textFormat: Text.PlainText
-    text: row2.isFav ? "󰋑" : "󰋕"
-    color: row2.isFav ? Color.accent : Qt.darker(Color.foreground, 1.5)
-    font.family: Style.font.family
-    font.pixelSize: Style.font.body
-  }
-
-  // Transient action feedback pill ("queued", "play next", …).
-  Rectangle {
-    visible: row2.flashText !== ""
-    anchors.right: parent.right
-    anchors.rightMargin: Style.space(12)
-    anchors.verticalCenter: parent.verticalCenter
-    radius: Style.cornerRadius
-    color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.22)
-    width: flashLabel.implicitWidth + Style.space(12)
-    height: flashLabel.implicitHeight + Style.space(4)
-
-    Text {
-      id: flashLabel
-      anchors.centerIn: parent
-      textFormat: Text.PlainText
-      text: row2.flashText
-      color: Color.accent
-      font.family: Style.font.family
-      font.pixelSize: Style.font.caption
-    }
-  }
+  // Transient action feedback pill ("queued", "play next", …) is a
+  // RowLayout child below — it takes space, never overlays the glyph.
 
   RowLayout {
     id: rowLayout
@@ -192,5 +156,45 @@ Item {
         elide: Text.ElideRight
       }
     }
+
+    // Transient action feedback pill ("queued", "play next", tier name):
+    // a layout sibling of the glyph, so it right-aligns up to the icon
+    // without ever covering it. Appears while active, then the row
+    // settles back to its reserved geometry.
+    Rectangle {
+      visible: row2.flashText !== ""
+      Layout.alignment: Qt.AlignVCenter
+      Layout.preferredWidth: flashLabel.implicitWidth + Style.space(12)
+      Layout.preferredHeight: flashLabel.implicitHeight + Style.space(4)
+      radius: Style.cornerRadius
+      color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.22)
+
+      Text {
+        id: flashLabel
+        anchors.centerIn: parent
+        textFormat: Text.PlainText
+        text: row2.flashText
+        color: Color.accent
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+    }
+    // Tier gutter: a fixed slot on every song row — reserved even when
+    // unrated, so glyphs align column-perfect whether or not anything
+    // shows. Liked reads quieter (opacity), Loved full white, Favorite
+    // full + accent.
+    Item {
+      Layout.preferredWidth: Style.space(16)
+      Layout.fillHeight: true
+      Layout.alignment: Qt.AlignVCenter
+      visible: row2.md.trackId !== undefined
+
+      TierGlyph {
+        anchors.centerIn: parent
+        tier: row2.tier
+        color: row2.tier === "favorite" ? Color.accent : Color.foreground
+      }
+    }
+
   }
 }

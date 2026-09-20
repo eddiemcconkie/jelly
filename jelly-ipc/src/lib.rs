@@ -5,6 +5,98 @@
 //! from the daemon. Keep every type here dependency-light (serde only).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// A track's score tier — stored server-side as the per-user
+/// `UserData.Rating` (Liked→8, Loved→9, Favorite→10; unrated = no
+/// rating). Unrated is behavioral zero: excluded from every tier
+/// filter, included in "All".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    Unrated,
+    Liked,
+    Loved,
+    Favorite,
+}
+
+impl Tier {
+    /// Rating value to persist, or `None` to clear (unrated).
+    pub fn rating(self) -> Option<f64> {
+        match self {
+            Tier::Unrated => None,
+            Tier::Liked => Some(8.0),
+            Tier::Loved => Some(9.0),
+            Tier::Favorite => Some(10.0),
+        }
+    }
+
+    /// Bucket a stored rating. Bands are generous so foreign values
+    /// (e.g. a 5 written elsewhere) still surface instead of vanishing:
+    /// favorite ≥9.5, loved ≥8.5, liked ≥6.5 (the server's own
+    /// "liked" threshold), below that unrated.
+    pub fn from_rating(rating: Option<f64>) -> Tier {
+        match rating {
+            Some(r) if r >= 9.5 => Tier::Favorite,
+            Some(r) if r >= 8.5 => Tier::Loved,
+            Some(r) if r >= 6.5 => Tier::Liked,
+            _ => Tier::Unrated,
+        }
+    }
+
+    /// The next tier in the cycle: unrated→liked→loved→favorite→unrated.
+    pub fn next(self) -> Tier {
+        match self {
+            Tier::Unrated => Tier::Liked,
+            Tier::Liked => Tier::Loved,
+            Tier::Loved => Tier::Favorite,
+            Tier::Favorite => Tier::Unrated,
+        }
+    }
+}
+
+/// The global playback filter: a session-wide minimum tier applied at
+/// walk time (contexts always hold every track; the filter decides what
+/// `next` finds). `All` plays everything.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TierFilter {
+    #[default]
+    All,
+    Liked,
+    Loved,
+    Favorite,
+}
+
+impl TierFilter {
+    pub fn min(self) -> Option<Tier> {
+        match self {
+            TierFilter::All => None,
+            TierFilter::Liked => Some(Tier::Liked),
+            TierFilter::Loved => Some(Tier::Loved),
+            TierFilter::Favorite => Some(Tier::Favorite),
+        }
+    }
+
+    /// Does a track at `tier` pass this filter? Unrated passes nothing
+    /// short of All.
+    pub fn passes(self, tier: Tier) -> bool {
+        match self.min() {
+            None => true,
+            Some(min) => tier >= min,
+        }
+    }
+
+    /// Step the ladder down/up: `up` moves All→Liked→Loved→Favorite;
+    /// down reverses that path. Both ends clamp.
+    pub fn step(self, up: bool) -> TierFilter {
+        use TierFilter::*;
+        let order = [All, Liked, Loved, Favorite];
+        let i = order.iter().position(|f| *f == self).unwrap_or(0);
+        let j = if up { (i + 1).min(order.len() - 1) } else { i.saturating_sub(1) };
+        order[j]
+    }
+}
 
 /// Client → daemon envelope: one of `ClientKind` plus an optional
 /// `req_id` that the daemon echoes back on every correlated reply.
@@ -90,9 +182,22 @@ pub enum ClientKind {
     SetRepeat { mode: RepeatMode },
     /// Toggles a fixed permutation of the context order only.
     SetShuffle { on: bool },
-    /// Toggle the favorite flag on one item (online only). The daemon
-    /// refreshes and pushes the favorite set on success.
+    /// DEPRECATED (superseded by `SetTier`/`CycleTier`, JELLY-39): the
+    /// favorite flag is now write-side only — Favorite tier hearts the
+    /// item for other clients, nothing in our UI renders favorites.
+    /// Kept one release for compatibility.
     ToggleFavorite { item_id: String },
+    /// Set a track's tier (synchronous server write; the command fails
+    /// and nothing changes while the server is unreachable). Favorite
+    /// also drives the native favorite flag; every other tier clears it.
+    SetTier { item_id: String, tier: Tier },
+    /// Cycle the track's tier (unrated→liked→loved→favorite→unrated).
+    /// The current tier comes from the daemon's tier map.
+    CycleTier { item_id: String },
+    /// Set the global playback filter directly.
+    SetFilter { filter: TierFilter },
+    /// Step the global filter: up = toward Favorite, down = toward All.
+    StepFilter { up: bool },
 }
 
 /// Daemon → client envelope: one of `DaemonKind` plus `req_id` echoed
@@ -259,11 +364,20 @@ pub struct PlaybackSnapshot {
     /// login and after every successful toggle.
     #[serde(default)]
     pub favorite_ids: Vec<String>,
+    /// Score tiers by track id — only tiers actually set (unrated is
+    /// absence). Seeded on login from user data and patched by the
+    /// session's `UserDataChanged` events.
+    #[serde(default)]
+    pub tiers: BTreeMap<String, Tier>,
+    /// The active global playback filter (walk-time minimum tier).
+    #[serde(default)]
+    pub filter: TierFilter,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RepeatMode {
+    #[default]
     Off,
     All,
     One,
@@ -285,6 +399,8 @@ impl Default for PlaybackSnapshot {
             library_rev: 0,
             auth: None,
             favorite_ids: Vec::new(),
+            tiers: BTreeMap::new(),
+            filter: TierFilter::default(),
         }
     }
 }
@@ -469,5 +585,115 @@ mod tests {
         assert!(json.contains("\"favorite_ids\""));
         let back: PlaybackSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.favorite_ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn tier_rating_mapping_is_lossless() {
+        for t in [Tier::Liked, Tier::Loved, Tier::Favorite] {
+            assert_eq!(Tier::from_rating(t.rating()), t);
+        }
+        assert_eq!(Tier::Unrated.rating(), None);
+        assert_eq!(Tier::from_rating(None), Tier::Unrated);
+    }
+
+    #[test]
+    fn tier_bands_absorb_foreign_ratings() {
+        // Server's "liked" threshold and up reads as tiers; junk below it
+        // (e.g. a legacy dislike written as rating 1) stays unrated.
+        assert_eq!(Tier::from_rating(Some(0.0)), Tier::Unrated);
+        assert_eq!(Tier::from_rating(Some(6.49)), Tier::Unrated);
+        assert_eq!(Tier::from_rating(Some(6.5)), Tier::Liked);
+        assert_eq!(Tier::from_rating(Some(7.9)), Tier::Liked);
+        assert_eq!(Tier::from_rating(Some(8.5)), Tier::Loved);
+        assert_eq!(Tier::from_rating(Some(9.4)), Tier::Loved);
+        assert_eq!(Tier::from_rating(Some(9.5)), Tier::Favorite);
+        assert_eq!(Tier::from_rating(Some(10.0)), Tier::Favorite);
+    }
+
+    #[test]
+    fn tier_cycles_back_to_unrated() {
+        assert_eq!(Tier::Unrated.next(), Tier::Liked);
+        assert_eq!(Tier::Liked.next(), Tier::Loved);
+        assert_eq!(Tier::Loved.next(), Tier::Favorite);
+        assert_eq!(Tier::Favorite.next(), Tier::Unrated);
+    }
+
+    #[test]
+    fn set_and_cycle_tier_commands_round_trip() {
+        let msg = ClientMessage::new(
+            ClientKind::SetTier {
+                item_id: "t1".into(),
+                tier: Tier::Loved,
+            },
+            Some(7),
+        );
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"set_tier\""));
+        assert!(json.contains("\"tier\":\"loved\""));
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+
+        let msg = ClientMessage::new(
+            ClientKind::CycleTier { item_id: "t2".into() },
+            None,
+        );
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"cycle_tier\""));
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn snapshot_tiers_round_trip_and_default() {
+        let mut snap = PlaybackSnapshot::default();
+        snap.tiers.insert("t1".into(), Tier::Favorite);
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: PlaybackSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tiers.get("t1"), Some(&Tier::Favorite));
+        // Older daemons/clients: absent fields default to empty/All.
+        let back: PlaybackSnapshot = serde_json::from_str("{\"status\":\"stopped\",\"position_secs\":0,\"volume\":100,\"shuffle\":false,\"repeat\":\"off\"}").unwrap();
+        assert!(back.tiers.is_empty());
+        assert_eq!(back.filter, TierFilter::All);
+    }
+
+    #[test]
+    fn tier_filter_is_a_minimum_not_an_exact_match() {
+        // Loved admits Loved and Favorite; unrated admits nothing short
+        // of All.
+        assert!(TierFilter::Liked.passes(Tier::Liked));
+        assert!(TierFilter::Liked.passes(Tier::Favorite));
+        assert!(!TierFilter::Liked.passes(Tier::Unrated));
+        assert!(TierFilter::Loved.passes(Tier::Loved));
+        assert!(TierFilter::Loved.passes(Tier::Favorite));
+        assert!(!TierFilter::Loved.passes(Tier::Liked));
+        assert!(TierFilter::Favorite.passes(Tier::Favorite));
+        assert!(!TierFilter::Favorite.passes(Tier::Loved));
+        for t in [Tier::Unrated, Tier::Liked, Tier::Loved, Tier::Favorite] {
+            assert!(TierFilter::All.passes(t));
+        }
+    }
+
+    #[test]
+    fn tier_filter_steppers_clamp_at_both_ends() {
+        assert_eq!(TierFilter::All.step(true), TierFilter::Liked);
+        assert_eq!(TierFilter::Liked.step(true), TierFilter::Loved);
+        assert_eq!(TierFilter::Loved.step(true), TierFilter::Favorite);
+        assert_eq!(TierFilter::Favorite.step(true), TierFilter::Favorite);
+        assert_eq!(TierFilter::Favorite.step(false), TierFilter::Loved);
+        assert_eq!(TierFilter::Liked.step(false), TierFilter::All);
+        assert_eq!(TierFilter::All.step(false), TierFilter::All);
+    }
+
+    #[test]
+    fn filter_commands_round_trip() {
+        let msg = ClientMessage::new(ClientKind::SetFilter { filter: TierFilter::Loved }, Some(4));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"set_filter\""));
+        assert!(json.contains("\"filter\":\"loved\""));
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+        let msg = ClientMessage::new(ClientKind::StepFilter { up: false }, None);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"step_filter\""));
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
     }
 }

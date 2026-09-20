@@ -34,3 +34,4 @@ reqwest.workspace = true
 zbus.workspace = true
 libmpv2.workspace = true
 uuid.workspace = true
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

@@ -25,6 +25,12 @@ async fn main() -> Result<()> {
     let (browse_tx, mut browse_rx) = mpsc::unbounded_channel::<server::BrowseRequest>();
     let (engine_event_tx, mut engine_event_rx) = mpsc::unbounded_channel();
 
+    // Session websocket: publishes the active Jellyfin session and turns
+    // UserDataChanged pushes into commands.
+    let (session_tx, session_rx) = watch::channel::<Option<jelly_daemon::session::Session>>(None);
+    let (session_event_tx, mut session_event_rx) = mpsc::unbounded_channel::<jelly_daemon::session::SessionEvent>();
+    jelly_daemon::session::spawn(session_rx, session_event_tx);
+
     let engine = playback::spawn(engine_event_tx, 100);
 
     // MPRIS shares cmd_tx with socket clients.
@@ -43,11 +49,17 @@ async fn main() -> Result<()> {
         cmd_tx: cmd_tx.clone(),
         model: jelly_daemon::model::PlaybackModel::new(),
         favorite_ids: Vec::new(),
+        tiers: Default::default(),
+        filter: Default::default(),
+        session_tx,
         position_secs: 0.0,
         duration_secs: None,
         volume: 100,
         status: jelly_ipc::PlaybackStatus::Stopped,
     };
+
+    // Restore session modes (shuffle/repeat/filter) from the last run.
+    coordinator.apply_startup_modes().await;
 
     // Try a silent login (never prompts; needs rbw unlocked).
     coordinator.try_autologin().await;
@@ -60,6 +72,7 @@ async fn main() -> Result<()> {
             Some(cmd) = cmd_rx.recv() => coordinator.handle_cmd(cmd).await,
             Some(req) = browse_rx.recv() => coordinator.handle_browse(req).await,
             Some(ev) = engine_event_rx.recv() => coordinator.handle_engine_event(ev).await,
+            Some(ev) = session_event_rx.recv() => coordinator.handle_cmd(AppCommand::SessionEvent(ev)).await,
             else => break,
         }
     }

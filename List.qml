@@ -459,8 +459,9 @@ Item {
   // quickshell outright, and a zero-height wrapper corrupted originY.
   property Component headerComponent: null
 
-  // Favorite-id lookup ({ id: true }); rows opt in via showFav.
-  property var favSet: ({})
+  // Tier lookup ({ id: "liked"|"loved"|"favorite" }); only rows with a
+  // trackId ever resolve a tier, and unrated tracks are absent ("").
+  property var tierMap: ({})
 
   // Optional hook: callers that know the playing row set this to focus it.
   property var focusPlayingHook: function() {}
@@ -552,36 +553,41 @@ Item {
 
       // Declarative bindings: the row's inputs update with the model, the
       // cursor and the transient flash — nothing is assigned imperatively.
+      // The header pseudo-row loads a different component (MetaHeader/
+      // queue strip) that owns none of these properties, so skip it.
+      readonly property bool bindsRow: rowLoader.item !== null
+        && !(rowWrap.modelData && rowWrap.modelData.headerRow === true)
+
       Binding {
         target: rowLoader.item
         property: "modelData"
         value: rowWrap.modelData
-        when: rowLoader.item !== null
+        when: rowWrap.bindsRow
       }
       Binding {
         target: rowLoader.item
         property: "index"
         value: rowWrap.index
-        when: rowLoader.item !== null
+        when: rowWrap.bindsRow
       }
       Binding {
         target: rowLoader.item
         property: "isCursor"
         value: rowWrap.index === list2.cursorPos && !list2.filtering
-        when: rowLoader.item !== null
+        when: rowWrap.bindsRow
       }
       Binding {
         target: rowLoader.item
-        property: "isFav"
-        value: list2.favSet[rowWrap.modelData ? rowWrap.modelData.trackId : ""] === true
-        when: rowLoader.item !== null
+        property: "tier"
+        value: list2.tierMap[rowWrap.modelData ? rowWrap.modelData.trackId : ""] || ""
+        when: rowWrap.bindsRow
       }
       Binding {
         target: rowLoader.item
         property: "flashText"
         value: (list2.flash !== null
                 && list2.flash.raw === list2.rawOf(rowWrap.modelData, rowWrap.index)) ? list2.flash.text : ""
-        when: rowLoader.item !== null
+        when: rowWrap.bindsRow
       }
     }
 

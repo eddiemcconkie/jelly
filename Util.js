@@ -7,6 +7,33 @@ function fmt(s) {
   return m + ":" + (r < 10 ? "0" : "") + r
 }
 
+// ---- tier vocabulary. Wire values (jelly_ipc::Tier, snake_case):
+// "" / "unrated" | "liked" | "loved" | "favorite". Filled Nerd Font
+// FontAwesome glyphs only — never the outline codepoints.
+
+var TIER_ORDER = ["", "liked", "loved", "favorite"]
+
+function tierGlyph(tier) {
+  if (tier === "liked") return "\uf164"
+  if (tier === "loved") return "\uf004"
+  if (tier === "favorite") return "\uf005"
+  return ""
+}
+
+// Icon opacity by tier: only Liked is quieted; Loved reads full white
+// and Favorite full + accent (color carries the top tier, opacity the
+// bottom one).
+function tierOpacity(tier) {
+  if (tier === "liked") return 0.5
+  return 1.0
+}
+
+// The tier reached by cycling from `tier` (f/F): unrated→liked→...→unrated.
+function tierNext(tier) {
+  var i = TIER_ORDER.indexOf(tier || "")
+  return TIER_ORDER[(i + 1) % TIER_ORDER.length]
+}
+
 // ---- shared filter predicates. Lists pass one of these to List; the
 // predicate receives (row, lowercased filter text).
 
