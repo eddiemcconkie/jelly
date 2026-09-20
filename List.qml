@@ -586,6 +586,8 @@ Item {
         target: rowLoader.item
         property: "flashText"
         value: (list2.flash !== null
+                && rowWrap.index === list2.cursorPos
+                && !list2.filtering
                 && list2.flash.raw === list2.rawOf(rowWrap.modelData, rowWrap.index)) ? list2.flash.text : ""
         when: rowWrap.bindsRow
       }
