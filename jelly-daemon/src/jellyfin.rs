@@ -5,11 +5,98 @@
 use anyhow::{Context, Result};
 use jelly_ipc::BrowseItem;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 pub const CLIENT_NAME: &str = "Jelly";
 pub const CLIENT_VERSION: &str = "0.1.0";
 const TIMEOUT: Duration = Duration::from_secs(30);
+const MIX_TAG_PREFIX: &str = "mix:";
+
+pub fn mix_label(tag: &str) -> Option<String> {
+    tag.strip_prefix(MIX_TAG_PREFIX)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
+
+fn mix_tag(label: &str) -> String {
+    format!("{MIX_TAG_PREFIX}{}", label.trim())
+}
+
+fn api_uuid(id: &str) -> String {
+    if id.len() == 32 {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &id[0..8],
+            &id[8..12],
+            &id[12..16],
+            &id[16..20],
+            &id[20..32]
+        )
+    } else {
+        id.to_string()
+    }
+}
+
+fn clone_field(item: &Value, field: &str, default: Value) -> Value {
+    item.get(field).cloned().unwrap_or(default)
+}
+
+fn metadata_update_body(item: &Value, tags: Vec<String>) -> Value {
+    // Mirrors Jellyfin Web's metadata editor DTO. Jellyfin 10.11 rejects
+    // smaller tag-only bodies for album metadata updates.
+    json!({
+        "Id": clone_field(item, "Id", Value::Null),
+        "Name": clone_field(item, "Name", json!("")),
+        "OriginalTitle": clone_field(item, "OriginalTitle", json!("")),
+        "OriginalLanguage": clone_field(item, "OriginalLanguage", json!("")),
+        "ForcedSortName": clone_field(item, "ForcedSortName", clone_field(item, "SortName", json!(""))),
+        "CommunityRating": clone_field(item, "CommunityRating", Value::Null),
+        "CriticRating": clone_field(item, "CriticRating", Value::Null),
+        "IndexNumber": clone_field(item, "IndexNumber", Value::Null),
+        "AirsBeforeSeasonNumber": clone_field(item, "AirsBeforeSeasonNumber", Value::Null),
+        "AirsAfterSeasonNumber": clone_field(item, "AirsAfterSeasonNumber", Value::Null),
+        "AirsBeforeEpisodeNumber": clone_field(item, "AirsBeforeEpisodeNumber", Value::Null),
+        "ParentIndexNumber": clone_field(item, "ParentIndexNumber", Value::Null),
+        "DisplayOrder": clone_field(item, "DisplayOrder", json!("")),
+        "Album": clone_field(item, "Album", json!("")),
+        "AlbumArtists": clone_field(item, "AlbumArtists", json!([])),
+        "ArtistItems": clone_field(item, "ArtistItems", json!([])),
+        "SeriesName": clone_field(item, "SeriesName", json!("")),
+        "Overview": clone_field(item, "Overview", json!("")),
+        "Status": clone_field(item, "Status", json!("")),
+        "AirDays": clone_field(item, "AirDays", json!([])),
+        "AirTime": clone_field(item, "AirTime", json!("")),
+        "Genres": clone_field(item, "Genres", json!([])),
+        "Tags": tags,
+        "Studios": clone_field(item, "Studios", json!([])),
+        "PremiereDate": clone_field(item, "PremiereDate", Value::Null),
+        "DateCreated": clone_field(item, "DateCreated", Value::Null),
+        "EndDate": clone_field(item, "EndDate", Value::Null),
+        "ProductionYear": clone_field(item, "ProductionYear", Value::Null),
+        "Height": clone_field(item, "Height", Value::Null),
+        "AspectRatio": clone_field(item, "AspectRatio", json!("")),
+        "Video3DFormat": clone_field(item, "Video3DFormat", Value::Null),
+        "OfficialRating": clone_field(item, "OfficialRating", json!("")),
+        "CustomRating": clone_field(item, "CustomRating", json!("")),
+        "People": clone_field(item, "People", json!([])),
+        "LockData": clone_field(item, "LockData", json!(false)),
+        "LockedFields": clone_field(item, "LockedFields", json!([])),
+        "ProviderIds": clone_field(item, "ProviderIds", json!({})),
+        "PreferredMetadataLanguage": clone_field(item, "PreferredMetadataLanguage", json!("")),
+        "PreferredMetadataCountryCode": clone_field(item, "PreferredMetadataCountryCode", json!("")),
+        "Taglines": clone_field(item, "Taglines", json!([])),
+    })
+}
+
+pub fn mix_labels(tags: &[String]) -> Vec<String> {
+    let mut labels = std::collections::BTreeMap::new();
+    for label in tags.iter().filter_map(|t| mix_label(t)) {
+        labels.entry(label.to_lowercase()).or_insert(label);
+    }
+    labels.into_values().collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct JellyfinClient {
@@ -59,6 +146,14 @@ pub struct MediaItem {
     pub image_tags: Option<ImageTags>,
     #[serde(rename = "MediaSources", default)]
     pub media_sources: Option<Vec<MediaSource>>,
+    #[serde(rename = "Tags", default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(rename = "ProductionYear", default)]
+    pub production_year: Option<i32>,
+    #[serde(rename = "ParentIndexNumber", default)]
+    pub parent_index_number: Option<i32>,
+    #[serde(rename = "IndexNumber", default)]
+    pub index_number: Option<i32>,
     #[serde(rename = "UserData", default)]
     user_data: Option<UserData>,
 }
@@ -183,7 +278,11 @@ impl JellyfinClient {
         Ok(auth.access_token)
     }
 
-    pub async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str, query: &[(&str, &str)]) -> Result<T> {
+    pub async fn get_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let resp = self
             .http
@@ -195,9 +294,13 @@ impl JellyfinClient {
             .with_context(|| format!("GET {path} failed"))?;
         let status = resp.status();
         if !status.is_success() {
-            anyhow::bail!("GET {path}: HTTP {status}");
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GET {path}: HTTP {status}: {body}");
         }
-        Ok(resp.json().await.with_context(|| format!("bad JSON from {path}"))?)
+        Ok(resp
+            .json()
+            .await
+            .with_context(|| format!("bad JSON from {path}"))?)
     }
 
     async fn post_json<B: Serialize + ?Sized>(&self, path: &str, body: &B) -> Result<()> {
@@ -210,8 +313,10 @@ impl JellyfinClient {
             .send()
             .await
             .with_context(|| format!("POST {path} failed"))?;
-        if !resp.status().is_success() {
-            anyhow::bail!("POST {path}: HTTP {}", resp.status());
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("POST {path}: HTTP {status}: {body}");
         }
         Ok(())
     }
@@ -312,10 +417,8 @@ impl JellyfinClient {
                     },
                 )
                 .await?;
-                self.delete_json(&format!(
-                    "/Users/{user_id}/Items/{item_id}/Rating"
-                ))
-                .await
+                self.delete_json(&format!("/Users/{user_id}/Items/{item_id}/Rating"))
+                    .await
             }
         }
     }
@@ -346,11 +449,12 @@ impl JellyfinClient {
     }
 
     pub fn image_url(&self, item: &MediaItem) -> Option<String> {
-        item.image_tags
-            .as_ref()?
-            .primary
-            .is_some()
-            .then(|| format!("{}/Items/{}/Images/Primary?fillWidth=320&quality=90", self.base_url, item.id))
+        item.image_tags.as_ref()?.primary.is_some().then(|| {
+            format!(
+                "{}/Items/{}/Images/Primary?fillWidth=320&quality=90",
+                self.base_url, item.id
+            )
+        })
     }
 
     /// Album artists — the top of the browse tree.
@@ -380,7 +484,7 @@ impl JellyfinClient {
                     ("includeItemTypes", "MusicAlbum"),
                     ("recursive", "true"),
                     ("sortBy", "SortName"),
-                    ("fields", "ImageTags,ChildCount"),
+                    ("fields", "ImageTags,ChildCount,Tags"),
                 ],
             )
             .await?;
@@ -422,6 +526,97 @@ impl JellyfinClient {
         Ok(resp.items)
     }
 
+    /// Set one album tag/mix. Jellyfin propagates album tag changes to
+    /// child tracks; LockedFields prevents future refreshes clobbering it.
+    pub async fn set_album_mix_tag(
+        &self,
+        album_id: &str,
+        label: &str,
+        present: Option<bool>,
+    ) -> Result<Vec<String>> {
+        let user_id = self.user_id.as_deref().context("not authenticated")?;
+        let wanted = mix_tag(label);
+        let mut resp: Value = self
+            .get_json(
+                &format!("/Users/{user_id}/Items"),
+                &[
+                    ("ids", album_id),
+                    (
+                        "fields",
+                        "ProviderIds,Genres,Studios,Overview,SortName,ProductionYear,PremiereDate,DateCreated,People,Tags",
+                    ),
+                ],
+            )
+            .await?;
+        let items = resp
+            .get_mut("Items")
+            .and_then(Value::as_array_mut)
+            .context("album response missing Items")?;
+        let album = items
+            .iter()
+            .find(|album| album.get("Id").and_then(Value::as_str) == Some(album_id))
+            .with_context(|| format!("album {album_id} not found"))?;
+        let mut tags: Vec<String> = album
+            .get("Tags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|tag| tag.as_str().map(ToString::to_string))
+            .collect();
+        let existing = tags.iter().position(|t| t.eq_ignore_ascii_case(&wanted));
+        let should_exist = present.unwrap_or(existing.is_none());
+        match (existing, should_exist) {
+            (Some(pos), false) => {
+                tags.remove(pos);
+            }
+            (None, true) => tags.push(wanted),
+            _ => {}
+        }
+        tags.sort_by_key(|t| t.to_lowercase());
+        let body = metadata_update_body(album, tags.clone());
+        self.post_json(&format!("/Items/{}", api_uuid(album_id)), &body)
+            .await?;
+        Ok(mix_labels(&tags))
+    }
+
+    /// Full track list for a mix tag. Sorting is album release year desc,
+    /// then disc, then track; contexts remain unfiltered by score.
+    pub async fn tracks_for_tag(&self, tag: &str) -> Result<Vec<MediaItem>> {
+        let user_id = self.user_id.as_deref().context("not authenticated")?;
+        let stored_tag = mix_tag(tag);
+        let resp: ItemsResponse = self
+            .get_json(
+                "/Items",
+                &[
+                    ("userId", user_id),
+                    ("includeItemTypes", "Audio"),
+                    ("recursive", "true"),
+                    ("tags", &stored_tag),
+                    ("fields", "ImageTags,MediaSources,Artists,ProductionYear,ParentIndexNumber,IndexNumber"),
+                    ("limit", "100000"),
+                ],
+            )
+            .await?;
+        let mut items = resp.items;
+        items.sort_by(|a, b| {
+            b.production_year
+                .unwrap_or_default()
+                .cmp(&a.production_year.unwrap_or_default())
+                .then(
+                    a.parent_index_number
+                        .unwrap_or_default()
+                        .cmp(&b.parent_index_number.unwrap_or_default()),
+                )
+                .then(
+                    a.index_number
+                        .unwrap_or_default()
+                        .cmp(&b.index_number.unwrap_or_default()),
+                )
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        Ok(items)
+    }
+
     /// User playlists.
     pub async fn playlists(&self) -> Result<Vec<MediaItem>> {
         let user_id = self.user_id.as_deref().context("not authenticated")?;
@@ -445,7 +640,13 @@ impl JellyfinClient {
         let user_id = self.user_id.as_deref().context("not authenticated")?;
         let path = format!("/Playlists/{playlist_id}/Items");
         let resp: ItemsResponse = self
-            .get_json(&path, &[("userId", user_id), ("fields", "ImageTags,MediaSources,Artists")])
+            .get_json(
+                &path,
+                &[
+                    ("userId", user_id),
+                    ("fields", "ImageTags,MediaSources,Artists"),
+                ],
+            )
             .await?;
         Ok(resp.items)
     }
@@ -460,14 +661,11 @@ pub fn browse_item_from(item: &MediaItem, image_url: Option<String>) -> BrowseIt
         detail: item
             .album_artist
             .clone()
-            .or_else(|| {
-                item.artists
-                    .as_ref()
-                    .and_then(|a| a.first().cloned())
-            })
+            .or_else(|| item.artists.as_ref().and_then(|a| a.first().cloned()))
             .unwrap_or_default(),
         duration_secs: item.run_time_ticks.map(|t| t as f64 / 10_000_000.0),
         image_url,
+        tags: mix_labels(&item.tags.clone().unwrap_or_default()),
     }
 }
 
@@ -478,13 +676,33 @@ mod tests {
     #[test]
     fn user_data_body_omits_absent_fields() {
         // 10.11 applies exactly the fields present in the DTO.
-        let b = UpdateUserItemData { rating: None, is_favorite: Some(false) };
-        assert_eq!(serde_json::to_string(&b).unwrap(), r#"{"IsFavorite":false}"#);
-        let b = UpdateUserItemData { rating: Some(8.0), is_favorite: Some(false) };
+        let b = UpdateUserItemData {
+            rating: None,
+            is_favorite: Some(false),
+        };
+        assert_eq!(
+            serde_json::to_string(&b).unwrap(),
+            r#"{"IsFavorite":false}"#
+        );
+        let b = UpdateUserItemData {
+            rating: Some(8.0),
+            is_favorite: Some(false),
+        };
         assert_eq!(
             serde_json::to_string(&b).unwrap(),
             r#"{"Rating":8.0,"IsFavorite":false}"#
         );
+    }
+
+    #[test]
+    fn mix_labels_strip_prefix_and_dedupe_case_insensitively() {
+        let labels = mix_labels(&[
+            "mix:Nintendo".into(),
+            "genre:Game".into(),
+            "mix:nintendo".into(),
+            "mix:Driving".into(),
+        ]);
+        assert_eq!(labels, vec!["Driving".to_string(), "Nintendo".to_string()]);
     }
 
     #[test]

@@ -10,12 +10,12 @@ use tokio::sync::{broadcast, mpsc, watch};
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let server_url = std::env::var("JELLY_SERVER").unwrap_or_else(|_| "https://jellyfin.mcconkie.dev".into());
+    let server_url =
+        std::env::var("JELLY_SERVER").unwrap_or_else(|_| "https://jellyfin.mcconkie.dev".into());
     tracing::info!("jelly daemon starting; server: {server_url}");
 
     let (state_tx, state_rx) = state::initial();
@@ -28,7 +28,8 @@ async fn main() -> Result<()> {
     // Session websocket: publishes the active Jellyfin session and turns
     // UserDataChanged pushes into commands.
     let (session_tx, session_rx) = watch::channel::<Option<jelly_daemon::session::Session>>(None);
-    let (session_event_tx, mut session_event_rx) = mpsc::unbounded_channel::<jelly_daemon::session::SessionEvent>();
+    let (session_event_tx, mut session_event_rx) =
+        mpsc::unbounded_channel::<jelly_daemon::session::SessionEvent>();
     jelly_daemon::session::spawn(session_rx, session_event_tx);
 
     let engine = playback::spawn(engine_event_tx, 100);
@@ -51,6 +52,7 @@ async fn main() -> Result<()> {
         favorite_ids: Vec::new(),
         tiers: Default::default(),
         filter: Default::default(),
+        mixes: Vec::new(),
         session_tx,
         position_secs: 0.0,
         duration_secs: None,

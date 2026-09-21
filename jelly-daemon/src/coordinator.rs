@@ -4,21 +4,36 @@
 //! transition is decided here and driven into the engine (which plays one
 //! track at a time). The watch-shared snapshot is derived from the model.
 
-use anyhow::Context as _;
 use crate::server::BrowseRequest;
 use crate::session::SessionEvent;
-use jelly_ipc::{ClientMessage};
-use jelly_ipc::{ClientKind, ErrorCode, PlaybackSnapshot, PlaybackStatus, RepeatMode, Tier, TrackMeta};
+use anyhow::Context as _;
+use jelly_ipc::ClientMessage;
+use jelly_ipc::{
+    ClientKind, ErrorCode, PlaybackSnapshot, PlaybackStatus, RepeatMode, Tier, TrackMeta,
+};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum AppCommand {
     /// Replace the playback context and start playing at `start_index`.
     /// The waiting queue survives unless `clear_queue` (queue-tab pick).
-    Play { tracks: Vec<TrackMeta>, start_index: usize, clear_queue: bool },
+    Play {
+        tracks: Vec<TrackMeta>,
+        start_index: usize,
+        clear_queue: bool,
+    },
     /// Play an album by id: the daemon fetches its tracks and starts at 0.
-    PlayAlbum { album_id: String, req_id: Option<u64> },
+    PlayAlbum {
+        album_id: String,
+        req_id: Option<u64>,
+    },
+    /// Play all tracks carrying this Jellyfin tag/mix.
+    PlayMix {
+        tag: String,
+        req_id: Option<u64>,
+    },
     Pause,
     Resume,
     Toggle,
@@ -30,26 +45,61 @@ pub enum AppCommand {
     SetRepeat(RepeatMode),
     SetShuffle(bool),
     /// Append tracks to the tail of the queue (starts playing if idle).
-    Enqueue { items: Vec<TrackMeta> },
+    Enqueue {
+        items: Vec<TrackMeta>,
+    },
     /// Insert a track at the head of the queue (plays next).
-    PlayNext { item: TrackMeta },
+    PlayNext {
+        item: TrackMeta,
+    },
     /// Jump to a waiting queue item, consuming earlier ones. `req_id`
     /// rides along so a refusal can be echoed to its requester.
-    JumpTo { index: usize, req_id: Option<u64> },
+    JumpTo {
+        index: usize,
+        req_id: Option<u64>,
+    },
     /// Remove the waiting queue item at this index.
-    RemoveFromQueue { index: usize, req_id: Option<u64> },
+    RemoveFromQueue {
+        index: usize,
+        req_id: Option<u64>,
+    },
     /// Move the waiting queue item at `index` by `delta` slots (clamped).
-    MoveQueue { index: usize, delta: i32, req_id: Option<u64> },
+    MoveQueue {
+        index: usize,
+        delta: i32,
+        req_id: Option<u64>,
+    },
     /// Toggle the favorite flag on an item; pushes the refreshed set.
-    ToggleFavorite { item_id: String, req_id: Option<u64> },
+    ToggleFavorite {
+        item_id: String,
+        req_id: Option<u64>,
+    },
     /// Set a track's tier (synchronous server write; failure = no change).
-    SetTier { item_id: String, tier: Tier, req_id: Option<u64> },
+    SetTier {
+        item_id: String,
+        tier: Tier,
+        req_id: Option<u64>,
+    },
+    /// Toggle one album tag/mix (synchronous server write).
+    ToggleTag {
+        album_id: String,
+        tag: String,
+        present: Option<bool>,
+        req_id: Option<u64>,
+    },
     /// Cycle a track's tier from its current value.
-    CycleTier { item_id: String, req_id: Option<u64> },
+    CycleTier {
+        item_id: String,
+        req_id: Option<u64>,
+    },
     /// Set the global playback filter (walk-time minimum tier).
-    SetFilter { filter: jelly_ipc::TierFilter },
+    SetFilter {
+        filter: jelly_ipc::TierFilter,
+    },
     /// Step the global filter: up = toward Favorite, down = toward All.
-    StepFilter { up: bool },
+    StepFilter {
+        up: bool,
+    },
     /// Raw event from the Jellyfin session websocket; the coordinator
     /// filters by user and applies tier echoes (our writes and edits from
     /// other devices).
@@ -63,11 +113,13 @@ fn cmd_title(cmd: &AppCommand) -> String {
     match cmd {
         AppCommand::Play { start_index, .. } => format!("Play@{start_index}"),
         AppCommand::PlayAlbum { album_id, .. } => format!("PlayAlbum {album_id}"),
+        AppCommand::PlayMix { tag, .. } => format!("PlayMix {tag}"),
         AppCommand::JumpTo { index, .. } => format!("JumpTo@{index}"),
         AppCommand::RemoveFromQueue { index, .. } => format!("Remove@{index}"),
         AppCommand::MoveQueue { index, delta, .. } => format!("Move@{index} {delta:+}"),
         AppCommand::ToggleFavorite { item_id, .. } => format!("Fav {item_id}"),
         AppCommand::SetTier { item_id, tier, .. } => format!("Tier {item_id} {tier:?}"),
+        AppCommand::ToggleTag { album_id, tag, .. } => format!("Tag {album_id} {tag}"),
         AppCommand::CycleTier { item_id, .. } => format!("TierCycle {item_id}"),
         AppCommand::SessionEvent(SessionEvent::UserDataChanged { entries, .. }) => {
             format!("SessionEvent UserDataChanged n={}", entries.len())
@@ -112,6 +164,8 @@ pub struct Coordinator {
     pub tiers: BTreeMap<String, Tier>,
     /// The global playback filter applied at walk time (JELLY-40).
     pub filter: jelly_ipc::TierFilter,
+    /// All known album tags/mixes, aggregated from the album browse list.
+    pub mixes: Vec<String>,
     /// Publishes the websocket session (token + user) for the session
     /// listener; `None` parks it (logout / failed login).
     pub session_tx: tokio::sync::watch::Sender<Option<crate::session::Session>>,
@@ -149,15 +203,17 @@ impl Coordinator {
             favorite_ids: self.favorite_ids.clone(),
             tiers: self.tiers.clone(),
             filter: self.filter,
+            mixes: self.mixes.clone(),
         }
     }
 
     pub async fn push_state(&self, old: &PlaybackSnapshot) {
         let snap = Arc::new(self.build_snapshot());
         let _ = self.state_tx.send(snap.clone());
-        let _ = self
-            .broadcast_tx
-            .send(DaemonMessage::new(DaemonKind::State(Box::new((*snap).clone())), None));
+        let _ = self.broadcast_tx.send(DaemonMessage::new(
+            DaemonKind::State(Box::new((*snap).clone())),
+            None,
+        ));
         let changed = crate::mpris::changed_props(old, &snap);
         if !changed.is_empty() {
             if let Err(e) = self.mpris.player_props_changed(changed).await {
@@ -173,8 +229,9 @@ impl Coordinator {
             Transition::Play(track) => {
                 self.position_secs = 0.0;
                 self.duration_secs = track.duration_secs;
-                self.engine
-                    .send(crate::playback::EngineCommand::PlayUrl(track.stream_url.clone()));
+                self.engine.send(crate::playback::EngineCommand::PlayUrl(
+                    track.stream_url.clone(),
+                ));
                 self.status = PlaybackStatus::Playing;
             }
             Transition::Stop => {
@@ -195,7 +252,11 @@ impl Coordinator {
         let old = self.build_snapshot();
         match cmd {
             AppCommand::Login => self.login().await,
-            AppCommand::Play { mut tracks, start_index, clear_queue } => {
+            AppCommand::Play {
+                mut tracks,
+                start_index,
+                clear_queue,
+            } => {
                 self.rebuild_stream_urls(&mut tracks);
                 if tracks.is_empty() {
                     return;
@@ -203,11 +264,16 @@ impl Coordinator {
                 let name = tracks[0].album.clone();
                 let artist = tracks[0].artist.clone();
                 let image = tracks[0].image_url.clone();
-                let t = self.model.set_context(name, artist, image, tracks, start_index, clear_queue);
+                let t =
+                    self.model
+                        .set_context(name, artist, image, tracks, start_index, clear_queue);
                 self.apply(t);
             }
             AppCommand::PlayAlbum { album_id, req_id } => {
                 self.play_album_and_apply(&album_id, req_id).await;
+            }
+            AppCommand::PlayMix { tag, req_id } => {
+                self.play_mix_and_apply(&tag, req_id).await;
             }
             AppCommand::Pause => {
                 self.engine.send(crate::playback::EngineCommand::Pause);
@@ -235,18 +301,22 @@ impl Coordinator {
                 // end must never push the optimistic position beyond it.
                 let max = self.duration_secs.unwrap_or(f64::MAX);
                 self.position_secs = pos.clamp(0.0, max);
-                self.engine.send(crate::playback::EngineCommand::Seek(self.position_secs));
+                self.engine
+                    .send(crate::playback::EngineCommand::Seek(self.position_secs));
             }
             AppCommand::SetVolume(v) => {
                 self.volume = v;
-                self.engine.send(crate::playback::EngineCommand::SetVolume(v));
+                self.engine
+                    .send(crate::playback::EngineCommand::SetVolume(v));
             }
             AppCommand::SetRepeat(mode) => {
                 self.model.repeat = mode;
                 // loop-file natively repeats the single track (repeat-one);
                 // repeat-all wrap and off/stop are the model's decisions.
                 self.engine
-                    .send(crate::playback::EngineCommand::SetLoopFile(mode == RepeatMode::One));
+                    .send(crate::playback::EngineCommand::SetLoopFile(
+                        mode == RepeatMode::One,
+                    ));
                 self.persist_modes().await;
             }
             AppCommand::SetShuffle(on) => {
@@ -301,7 +371,11 @@ impl Coordinator {
                     ));
                 }
             }
-            AppCommand::MoveQueue { index, delta, req_id } => {
+            AppCommand::MoveQueue {
+                index,
+                delta,
+                req_id,
+            } => {
                 if !self.model.move_item(index, delta) {
                     let _ = self.broadcast_tx.send(DaemonMessage::new(
                         DaemonKind::Error {
@@ -330,7 +404,9 @@ impl Coordinator {
                                     tracing::warn!("favorite refresh failed: {e:#}");
                                     // Toggle succeeded; approximate by
                                     // flipping this one id locally.
-                                    if let Some(p) = self.favorite_ids.iter().position(|i| i == &item_id) {
+                                    if let Some(p) =
+                                        self.favorite_ids.iter().position(|i| i == &item_id)
+                                    {
                                         self.favorite_ids.remove(p);
                                     } else {
                                         self.favorite_ids.push(item_id.clone());
@@ -350,11 +426,28 @@ impl Coordinator {
                     }
                 }
             }
-            AppCommand::SetTier { item_id, tier, req_id } => {
+            AppCommand::SetTier {
+                item_id,
+                tier,
+                req_id,
+            } => {
                 self.write_tier(&item_id, tier, req_id).await;
             }
+            AppCommand::ToggleTag {
+                album_id,
+                tag,
+                present,
+                req_id,
+            } => {
+                self.write_album_tag(&album_id, &tag, present, req_id).await;
+            }
             AppCommand::CycleTier { item_id, req_id } => {
-                let next = self.tiers.get(&item_id).copied().unwrap_or(Tier::Unrated).next();
+                let next = self
+                    .tiers
+                    .get(&item_id)
+                    .copied()
+                    .unwrap_or(Tier::Unrated)
+                    .next();
                 self.write_tier(&item_id, next, req_id).await;
             }
             AppCommand::SessionEvent(ev) => match ev {
@@ -432,7 +525,12 @@ impl Coordinator {
     /// while the model walks mutably. Queue consumption and all walk
     /// semantics live in `PlaybackModel::next_with` (tested there).
     fn filtered_next(&mut self) -> crate::model::Transition {
-        let Self { model, filter, tiers, .. } = self;
+        let Self {
+            model,
+            filter,
+            tiers,
+            ..
+        } = self;
         model.next_with(&|t: &TrackMeta| {
             let tier = tiers.get(&t.id).copied().unwrap_or(Tier::Unrated);
             filter.passes(tier)
@@ -464,6 +562,48 @@ impl Coordinator {
         }
     }
 
+    async fn write_album_tag(
+        &mut self,
+        album_id: &str,
+        tag: &str,
+        present: Option<bool>,
+        req_id: Option<u64>,
+    ) {
+        if !self.client.is_authenticated() {
+            let _ = self.broadcast_tx.send(DaemonMessage::new(
+                DaemonKind::Error {
+                    code: ErrorCode::NotAuthenticated,
+                    message: "mixes need an authenticated session".into(),
+                },
+                req_id,
+            ));
+            return;
+        }
+        match self.client.set_album_mix_tag(album_id, tag, present).await {
+            Ok(tags) => {
+                if let Ok(albums) = self.client.all_albums().await {
+                    self.refresh_mixes_from_albums(&albums);
+                }
+                let _ = self.broadcast_tx.send(DaemonMessage::new(
+                    DaemonKind::TagUpdate {
+                        album_id: album_id.to_string(),
+                        tags,
+                    },
+                    req_id,
+                ));
+            }
+            Err(e) => {
+                let _ = self.broadcast_tx.send(DaemonMessage::new(
+                    DaemonKind::Error {
+                        code: ErrorCode::Internal,
+                        message: format!("tag write failed: {e:#}"),
+                    },
+                    req_id,
+                ));
+            }
+        }
+    }
+
     /// Fill in direct-play stream URLs from item ids (the client never
     /// sends them).
     fn rebuild_stream_urls(&self, tracks: &mut [TrackMeta]) {
@@ -477,7 +617,9 @@ impl Coordinator {
     /// Fetch one item's media metadata.
     async fn fetch_item(&self, id: &str) -> anyhow::Result<crate::jellyfin::MediaItem> {
         let user_id = self.client.user_id().context("not authenticated")?;
-        self.client.get_json(&format!("/Users/{user_id}/Items/{id}"), &[]).await
+        self.client
+            .get_json(&format!("/Users/{user_id}/Items/{id}"), &[])
+            .await
     }
 
     /// Play an album by id without the client having its track list:
@@ -507,9 +649,11 @@ impl Coordinator {
             .map(|it| TrackMeta {
                 id: it.id.clone(),
                 name: it.name.clone(),
-                artist: it.album_artist.clone().or_else(||
-                    it.artists.as_ref().and_then(|a| a.first().cloned())
-                ).unwrap_or_default(),
+                artist: it
+                    .album_artist
+                    .clone()
+                    .or_else(|| it.artists.as_ref().and_then(|a| a.first().cloned()))
+                    .unwrap_or_default(),
                 album: album.name.clone(),
                 duration_secs: it.run_time_ticks.map(|t| t as f64 / 10_000_000.0),
                 image_url: self.client.image_url(&album),
@@ -544,10 +688,99 @@ impl Coordinator {
         self.rebuild_stream_urls(&mut tracks);
         let name = album.name.clone();
         let artist = tracks[start_index].artist.clone();
+        let t = self.model.set_context(
+            name,
+            artist,
+            self.client.image_url(&album),
+            tracks,
+            start_index,
+            false,
+        );
+        self.apply(t);
+    }
+
+    async fn play_mix_and_apply(&mut self, tag: &str, req_id: Option<u64>) {
+        if !self.client.is_authenticated() {
+            tracing::warn!("play_mix before authentication; send login first");
+            return;
+        }
+        let items = match self.client.tracks_for_tag(tag).await {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = self.broadcast_tx.send(DaemonMessage::new(
+                    DaemonKind::Error {
+                        code: ErrorCode::Internal,
+                        message: format!("mix fetch failed: {e:#}"),
+                    },
+                    req_id,
+                ));
+                return;
+            }
+        };
+        let tracks: Vec<TrackMeta> = items
+            .iter()
+            .map(|it| TrackMeta {
+                id: it.id.clone(),
+                name: it.name.clone(),
+                artist: it
+                    .album_artist
+                    .clone()
+                    .or_else(|| it.artists.as_ref().and_then(|a| a.first().cloned()))
+                    .unwrap_or_default(),
+                album: it.album_id.clone().unwrap_or_default(),
+                duration_secs: it.run_time_ticks.map(|t| t as f64 / 10_000_000.0),
+                image_url: self.client.image_url(it),
+                stream_url: String::new(),
+            })
+            .collect();
+        if tracks.is_empty() {
+            let _ = self.broadcast_tx.send(DaemonMessage::new(
+                DaemonKind::Error {
+                    code: ErrorCode::NotFound,
+                    message: format!("mix '{tag}' has no tracks"),
+                },
+                req_id,
+            ));
+            return;
+        }
+        let start_index = if self.filter == jelly_ipc::TierFilter::All {
+            0
+        } else {
+            match tracks.iter().position(|t| {
+                let tier = self.tiers.get(&t.id).copied().unwrap_or(Tier::Unrated);
+                self.filter.passes(tier)
+            }) {
+                Some(i) => i,
+                None => {
+                    let _ = self.broadcast_tx.send(DaemonMessage::new(
+                        DaemonKind::Error {
+                            code: ErrorCode::BadMessage,
+                            message: format!("no {} tracks", filter_label(self.filter)),
+                        },
+                        req_id,
+                    ));
+                    return;
+                }
+            }
+        };
+        let mut tracks = tracks;
+        self.rebuild_stream_urls(&mut tracks);
         let t = self
             .model
-            .set_context(name, artist, self.client.image_url(&album), tracks, start_index, false);
+            .set_context(format!("Mix: {tag}"), "", None, tracks, start_index, false);
         self.apply(t);
+    }
+
+    fn refresh_mixes_from_albums(&mut self, albums: &[crate::jellyfin::MediaItem]) {
+        let mut set = BTreeSet::new();
+        for album in albums {
+            for tag in album.tags.clone().unwrap_or_default() {
+                if let Some(label) = crate::jellyfin::mix_label(&tag) {
+                    set.insert(label);
+                }
+            }
+        }
+        self.mixes = set.into_iter().collect();
     }
 
     /// Answer a browse request routed from the socket server. Replies are
@@ -564,12 +797,12 @@ impl Coordinator {
             ));
             return;
         }
-        let fetched: anyhow::Result<Vec<crate::jellyfin::MediaItem>> = match kind {
-        ClientKind::BrowseAlbums => self.client.all_albums().await,
-            ClientKind::BrowseTracks { album_id } => self.client.tracks_for_album(&album_id).await,
+        let fetched: anyhow::Result<Vec<crate::jellyfin::MediaItem>> = match &kind {
+            ClientKind::BrowseAlbums => self.client.all_albums().await,
+            ClientKind::BrowseTracks { album_id } => self.client.tracks_for_album(album_id).await,
             ClientKind::BrowsePlaylists => self.client.playlists().await,
             ClientKind::BrowsePlaylistTracks { playlist_id } => {
-                self.client.playlist_tracks(&playlist_id).await
+                self.client.playlist_tracks(playlist_id).await
             }
             other => {
                 let _ = req.reply.send(DaemonMessage::new(
@@ -584,6 +817,9 @@ impl Coordinator {
         };
         let reply = match fetched {
             Ok(items) => {
+                if matches!(kind, ClientKind::BrowseAlbums) {
+                    self.refresh_mixes_from_albums(&items);
+                }
                 let items = items
                     .into_iter()
                     .map(|item| {
@@ -643,21 +879,23 @@ impl Coordinator {
             return;
         }
         match crate::rbw::get_credentials().await {
-            Ok((username, password)) => match self.client.authenticate(&username, &password).await {
-                Ok(_) => {
-                    tracing::info!("authenticated as {username}");
-                    let _ = self.auth_tx.send(AuthStatus::Authenticated);
-                    crate::rbw::cache_credentials(&crate::rbw::CachedCredentials {
-                        username: username.clone(),
-                        password,
-                    });
-                    self.refresh_user_state().await;
+            Ok((username, password)) => {
+                match self.client.authenticate(&username, &password).await {
+                    Ok(_) => {
+                        tracing::info!("authenticated as {username}");
+                        let _ = self.auth_tx.send(AuthStatus::Authenticated);
+                        crate::rbw::cache_credentials(&crate::rbw::CachedCredentials {
+                            username: username.clone(),
+                            password,
+                        });
+                        self.refresh_user_state().await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("login failed: {e:#}");
+                        let _ = self.auth_tx.send(AuthStatus::Failed);
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("login failed: {e:#}");
-                    let _ = self.auth_tx.send(AuthStatus::Failed);
-                }
-            },
+            }
             Err(e) => {
                 tracing::warn!("rbw credential fetch failed: {e:#}");
                 let _ = self.auth_tx.send(AuthStatus::NeedsUnlock);
@@ -715,9 +953,10 @@ impl Coordinator {
                 let mut snap = self.build_snapshot();
                 snap.position_secs = pos;
                 self.state_tx.send_replace(Arc::new(snap));
-                let _ = self
-                    .broadcast_tx
-                    .send(DaemonMessage::new(DaemonKind::Position { position_secs: pos }, None));
+                let _ = self.broadcast_tx.send(DaemonMessage::new(
+                    DaemonKind::Position { position_secs: pos },
+                    None,
+                ));
                 return;
             }
             crate::playback::EngineEvent::Duration(d) => {

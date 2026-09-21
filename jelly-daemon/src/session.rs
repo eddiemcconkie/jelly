@@ -199,11 +199,19 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(
             entries[0],
-            UserDataEntry { item_id: "i1".into(), rating: Some(8.0), favorite: false }
+            UserDataEntry {
+                item_id: "i1".into(),
+                rating: Some(8.0),
+                favorite: false
+            }
         );
         assert_eq!(
             entries[1],
-            UserDataEntry { item_id: "i2".into(), rating: None, favorite: true }
+            UserDataEntry {
+                item_id: "i2".into(),
+                rating: None,
+                favorite: true
+            }
         );
     }
 
@@ -236,7 +244,8 @@ mod tests {
 
     #[test]
     fn empty_or_missing_lists_parse_clean() {
-        let raw = r#"{"MessageType":"UserDataChanged","Data":"{\"UserId\":\"u\",\"UserDataList\":[]}"}"#;
+        let raw =
+            r#"{"MessageType":"UserDataChanged","Data":"{\"UserId\":\"u\",\"UserDataList\":[]}"}"#;
         let ev = parse_message(raw).unwrap();
         assert!(matches!(ev, SessionEvent::UserDataChanged { entries, .. } if entries.is_empty()));
         // No Data at all -> ignored, not a crash.

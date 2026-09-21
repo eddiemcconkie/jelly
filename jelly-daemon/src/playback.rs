@@ -5,8 +5,8 @@
 //! `PlayUrl` for the next song. The engine just plays, reports position,
 //! and says when a track ended (EOF). See model.rs for the decisions.
 
-use libmpv2::Mpv;
 use jelly_ipc::PlaybackStatus;
+use libmpv2::Mpv;
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc;
 
@@ -109,7 +109,11 @@ fn run_engine(
     }
 }
 
-fn set_status(status: &mut PlaybackStatus, event_tx: &mpsc::UnboundedSender<EngineEvent>, to: PlaybackStatus) {
+fn set_status(
+    status: &mut PlaybackStatus,
+    event_tx: &mpsc::UnboundedSender<EngineEvent>,
+    to: PlaybackStatus,
+) {
     if *status != to {
         *status = to;
         let _ = event_tx.send(EngineEvent::Status(to));

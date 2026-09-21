@@ -21,7 +21,11 @@ pub struct CachedCredentials {
 
 fn cache_path() -> Option<std::path::PathBuf> {
     let dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    Some(std::path::Path::new(&dir).join("jelly").join("credentials.json"))
+    Some(
+        std::path::Path::new(&dir)
+            .join("jelly")
+            .join("credentials.json"),
+    )
 }
 
 /// Read cached credentials, if present and well-formed. Any error means

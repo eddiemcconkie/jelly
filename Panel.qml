@@ -27,8 +27,6 @@ Panel {
       "Escape": Qt.Key_Escape,
       "Up": Qt.Key_Up,
       "Down": Qt.Key_Down,
-      "Left": Qt.Key_Left,
-      "Right": Qt.Key_Right,
       "Space": Qt.Key_Space
     }
     var key = keys[name] !== undefined ? keys[name] : 0
@@ -36,7 +34,8 @@ Panel {
     var ev = { key: key, text: text, isAutoRepeat: false, accepted: false }
     // Mirror the real focus path: while the palette is open keys land on
     // the modal, not the panel router.
-    if (paletteOpen) handlePaletteKey(ev)
+    if (mixModalOpen) handleMixModalKey(ev)
+    else if (paletteOpen) handlePaletteKey(ev)
     else panel.handleGlobalKey(ev)
   }
   readonly property var barIdentity: hostWidget || root
@@ -75,6 +74,10 @@ Panel {
     albums: albumList,
     playlists: [{ name: "Playlists", items: playlistList }]
   })
+  // Mix names are the union of the daemon's aggregated tag list and every
+  // tag present on the (optimistically-updated) album list, so a new mix
+  // shows before the round-trip and a removed one disappears at once.
+  readonly property var mixList: uniqueNames((snap.mixes || []).concat(allAlbumTags()))
 
   // req_id -> request descriptor, so browse replies can be routed.
   property var pending: ({})
@@ -116,7 +119,7 @@ Panel {
     delete pending[msg.req_id]
     if (req.kind === "browse_albums") {
       var acc = items.map(function(x) {
-        return { id: x.id, title: x.name, artist: x.detail || "", cover: x.image_url || "", tracks: [] }
+        return { id: x.id, title: x.name, artist: x.detail || "", cover: x.image_url || "", tags: x.tags || [], tracks: [] }
       })
       // The server's SortName is franchise-edited on this server; sort by
       // plain album title here so the overview is alphabetical regardless.
@@ -131,7 +134,7 @@ Panel {
       for (var m = 0; m < next.length; m++) {
         if (next[m].id !== albumId) continue
         next[m] = {
-          id: next[m].id, title: next[m].title, artist: next[m].artist, cover: next[m].cover,
+          id: next[m].id, title: next[m].title, artist: next[m].artist, cover: next[m].cover, tags: next[m].tags || [],
           tracks: items.map(function(x) {
             return { id: x.id, title: x.name, artist: x.detail || next[m].artist,
                      length: x.duration_secs || 0 }
@@ -269,8 +272,18 @@ Panel {
               root.position = msg.position_secs
             } else if (msg.type === "browse") {
               root.onBrowse(msg)
+            } else if (msg.type === "tag_update") {
+              root.applyTagUpdate(msg.album_id, msg.tags || [], msg.req_id)
             } else if (msg.type === "error") {
               console.warn("jelly daemon error:", msg.message)
+              var tagReq = root.pendingTagReqs[msg.req_id]
+              if (tagReq && root.pendingTagReqsByAlbum[tagReq.albumId] === msg.req_id) {
+                root.applyAlbumTags(tagReq.albumId, tagReq.prevTags || [])
+                root.mixModalError = msg.message || "tag write failed"
+                root.mixModalBusyTag = ""
+                delete root.pendingTagReqsByAlbum[tagReq.albumId]
+                delete root.pendingTagReqs[msg.req_id]
+              }
               if (root.pendingAlbumPlayRaw !== "" && (msg.message || "").indexOf("no ") === 0) {
                 root.flashRow(root.pendingAlbumPlayRaw, msg.message)
                 root.pendingAlbumPlayRaw = ""
@@ -357,6 +370,8 @@ Panel {
   // Transient feedback for row actions.
   property var rowFlash: null
   property string pendingAlbumPlayRaw: ""
+  property var pendingTagReqs: ({})
+  property var pendingTagReqsByAlbum: ({})
   Timer { id: rowFlashTimer; interval: 1400; onTriggered: root.rowFlash = null }
 
   function albumMetas(al) {
@@ -364,6 +379,66 @@ Panel {
       return { id: t.id, name: t.title, artist: t.artist || "", album: al.title,
                duration_secs: t.length || null, image_url: al.cover || null, stream_url: "" }
     })
+  }
+
+  function albumById(id) {
+    for (var i = 0; i < albumList.length; i++) if (albumList[i].id === id) return albumList[i]
+    return null
+  }
+
+  function applyTagUpdate(albumId, tags, reqId) {
+    // Reconcile like the tier system: the daemon serializes tag writes and
+    // echoes the originating req_id. A confirmation whose req_id is no longer
+    // the newest pending request for this album is stale (a superseded write
+    // in a rapid on/off sequence) and must not stomp the live optimistic
+    // state — drop it and let the newest request's confirmation land.
+    if (pendingTagReqsByAlbum[albumId] !== reqId) {
+      console.info("jelly: drop stale tag_update req", reqId, "for", albumId,
+                   "newest is", pendingTagReqsByAlbum[albumId])
+      return
+    }
+    applyAlbumTags(albumId, tags)
+    console.info("jelly: accept tag_update req", reqId, "album", albumId, "tags", JSON.stringify(tags))
+    delete pendingTagReqsByAlbum[albumId]
+    delete pendingTagReqs[reqId]
+    mixModalBusyTag = ""
+    mixModalError = ""
+  }
+
+  function uniqueNames(names) {
+    var seen = {}
+    var out = []
+    for (var i = 0; i < names.length; i++) {
+      var name = (names[i] || "").trim()
+      if (name === "") continue
+      var key = name.toLowerCase()
+      if (seen[key]) continue
+      seen[key] = true
+      out.push(name)
+    }
+    out.sort(function(a, b) { return a.toLowerCase() < b.toLowerCase() ? -1 : 1 })
+    return out
+  }
+
+  function allAlbumTags() {
+    var names = []
+    for (var i = 0; i < albumList.length; i++) {
+      var ts = albumList[i].tags || []
+      for (var j = 0; j < ts.length; j++) names.push(ts[j])
+    }
+    return names
+  }
+
+  function applyAlbumTags(albumId, tags) {
+    var next = albumList.slice()
+    for (var i = 0; i < next.length; i++) {
+      if (next[i].id !== albumId) continue
+      next[i] = { id: next[i].id, title: next[i].title, artist: next[i].artist,
+                  cover: next[i].cover, tags: uniqueNames(tags), tracks: next[i].tracks || [] }
+      break
+    }
+    albumList = next
+    if (mixModalAlbum && mixModalAlbum.id === albumId) mixModalAlbum = albumById(albumId)
   }
 
   function viewRows() {
@@ -443,6 +518,12 @@ Panel {
         return { raw: c.key, key: c.key, desc: c.desc, section: "" }
       })
     }
+    if (tab === "mixes") {
+      return mixList.map(function(tag) {
+        return { raw: "mix:" + tag, isMix: true, title: tag, artist: "Mix", sub: "Tagged albums",
+                 cover: "", showCover: false, showGlyph: false, section: "" }
+      })
+    }
     return []
   }
 
@@ -480,6 +561,11 @@ Panel {
         startPlayback(item.metas, item.ctxIndex, true); return
       }
     }
+    if (tab === "mixes" && item.isMix) {
+      pendingAlbumPlayRaw = item.raw
+      send({ type: "play_mix", tag: item.title })
+      return
+    }
   }
 
   // Guard rails for row actions: duplicate-queue guard, offline
@@ -514,6 +600,22 @@ Panel {
     }
   }
 
+  // Auto-repeat is OFF by default: a held key fires the discrete action
+  // once, not in a burst. Handlers call this to allow repeat on the small
+  // set of keys where holding is the natural interaction: cursor nav
+  // (j/k, Up/Down), seek (,/.) and filter/text editing (Backspace and any
+  // printable character while a text field is open).
+  function listNavRepeats(event) {
+    if (event.key === Qt.Key_Up || event.key === Qt.Key_Down) return true
+    var t = event.text
+    return t === "j" || t === "k"
+  }
+  function textEditRepeats(event, editing) {
+    if (!editing) return false
+    if (event.key === Qt.Key_Backspace) return true
+    return !!(event.text && event.text.length === 1)
+  }
+
   // Row-level keys List doesn't consume (q/p/f/d/J/K), dispatched to the
   // actions above.
   function flashRow(raw, text) {
@@ -528,6 +630,7 @@ Panel {
     if (t === "q") { rowAction("queue", item); return true }
     if (t === "p") { rowAction("next", item); return true }
     if (t === "f") { rowAction("tier", item); return true }
+    if (t === "m" && tab === "albums" && item.isAlbum) { openMixModal(item.albumId); return true }
     var inQueue = item.queueIndex !== undefined && item.queueIndex !== null
     if (t === "d" && inQueue) {
       send({ type: "remove_from_queue", index: item.queueIndex }); return true
@@ -577,7 +680,7 @@ Panel {
 
   // Cycle tabs in display order; [ goes left, ] goes right, wrapping.
   function cycleTab(dir) {
-    var order = ["queue", "albums", "commands"]
+    var order = ["queue", "albums", "mixes", "commands"]
     var next = (order.indexOf(tab) + dir + order.length) % order.length
     switchTab(order[next])
   }
@@ -611,6 +714,12 @@ Panel {
   //      same List component as the main views so cursor/scroll/filter
   //      behavior is identical everywhere.
   property bool paletteOpen: false
+  property bool mixModalOpen: false
+  property var mixModalAlbum: null
+  property bool mixModalInputMode: false
+  property string mixModalNewName: ""
+  property string mixModalError: ""
+  property string mixModalBusyTag: ""
 
   readonly property var commands: [
     { key: "j", desc: "Move cursor down" },
@@ -631,6 +740,7 @@ Panel {
     { key: "J", desc: "Move queue item down" },
     { key: "K", desc: "Move queue item up" },
     { key: "f", desc: "Cycle tier on selection" },
+    { key: "m", desc: "Edit album mixes" },
     { key: "F", desc: "Cycle tier on playing song" },
     { key: "[", desc: "Step playback filter down (toward All)" },
     { key: "]", desc: "Step playback filter up (toward Favorite)" },
@@ -659,6 +769,154 @@ Panel {
     })
   }
 
+  function openMixModal(albumId) {
+    mixModalAlbum = albumById(albumId)
+    if (!mixModalAlbum) return
+    mixModalInputMode = false
+    mixModalNewName = ""
+    mixModalError = ""
+    mixModalBusyTag = ""
+    mixModalOpen = true
+    Qt.callLater(function() { mixTagList.resetCursor(); mixModal.forceActiveFocus() })
+  }
+
+  function closeMixModal() {
+    mixModalOpen = false
+    Qt.callLater(function() { keyFocus.forceActiveFocus() })
+  }
+
+  function mixModalRows() {
+    var tags = {}
+    var alTags = (mixModalAlbum && mixModalAlbum.tags) || []
+    for (var i = 0; i < alTags.length; i++) tags[alTags[i]] = true
+    for (var j = 0; j < mixList.length; j++) tags[mixList[j]] = true
+    var names = Object.keys(tags).sort(function(a, b) { return a.toLowerCase() < b.toLowerCase() ? -1 : 1 })
+    var rows = [{
+      raw: "new",
+      checkbox: "+",
+      desc: mixModalInputMode ? mixModalNewName : "New Mix",
+      inputMode: mixModalInputMode,
+      isNewMix: true,
+      section: ""
+    }]
+    for (var n = 0; n < names.length; n++) {
+      var tag = names[n]
+      var selected = hasMixTag(alTags, tag)
+      var count = mixAlbumCount(tag)
+      rows.push({ raw: "tag:" + tag, checkbox: (selected ? "󰄲" : "󰄱"), desc: tag, tag: tag,
+                  selected: selected, albumCount: count, albumCountText: albumCountText(count), section: "" })
+    }
+    return rows
+  }
+
+  function hasMixTag(tags, tag) {
+    for (var i = 0; i < tags.length; i++) if ((tags[i] || "").toLowerCase() === tag.toLowerCase()) return true
+    return false
+  }
+
+  function mixAlbumCount(tag) {
+    var count = 0
+    for (var i = 0; i < albumList.length; i++) {
+      if (hasMixTag(albumList[i].tags || [], tag)) count++
+    }
+    return count
+  }
+
+  function albumCountText(count) {
+    return count + " album" + (count === 1 ? "" : "s")
+  }
+
+  function canonicalMixLabel(label) {
+    var wanted = (label || "").trim()
+    if (wanted === "") return ""
+    var all = ((mixModalAlbum && mixModalAlbum.tags) || []).concat(mixList)
+    for (var i = 0; i < all.length; i++) {
+      if ((all[i] || "").toLowerCase() === wanted.toLowerCase()) return all[i]
+    }
+    return wanted
+  }
+
+  function setMixTag(tag, present) {
+    if (!connected) { mixModalError = "offline — mixes need a daemon connection"; return }
+    tag = canonicalMixLabel(tag)
+    if (!mixModalAlbum || !tag) return
+    var prev = (mixModalAlbum.tags || []).slice()
+    var next = prev.slice()
+    var pos = -1
+    for (var i = 0; i < next.length; i++) if (next[i].toLowerCase() === tag.toLowerCase()) pos = i
+    if (present && pos < 0) next.push(tag)
+    if (!present && pos >= 0) next.splice(pos, 1)
+    var id = reqSeq++
+    var superseded = pendingTagReqsByAlbum[mixModalAlbum.id]
+    if (superseded !== undefined) delete pendingTagReqs[superseded]
+    pendingTagReqs[id] = { albumId: mixModalAlbum.id, tag: tag, prevTags: prev }
+    pendingTagReqsByAlbum[mixModalAlbum.id] = id
+    applyAlbumTags(mixModalAlbum.id, next)
+    console.info("jelly: toggle_tag req", id, "album", mixModalAlbum.id, "tag", tag, "present", present,
+                 "superseded", superseded)
+    mixModalBusyTag = (present ? "adding " : "removing ") + tag
+    mixModalError = ""
+    send({ type: "toggle_tag", album_id: mixModalAlbum.id, tag: tag, present: present, req_id: id })
+    mixModalBusyTag = ""
+  }
+
+  function addMixTag(tag) {
+    setMixTag(tag, true)
+  }
+
+  function removeMixTag(tag) {
+    setMixTag(tag, false)
+  }
+
+  function toggleMixTag(tag) {
+    if (!mixModalAlbum || !tag) return
+    setMixTag(tag, !hasMixTag(mixModalAlbum.tags || [], tag))
+  }
+
+  function handleMixModalKey(event) {
+    // Repeat is opt-in here too: only cursor nav and, while typing a new
+    // mix, Backspace/printable editing repeat. Esc/m/Enter and list actions
+    // are one-shot (see listNavRepeats/textEditRepeats).
+    var repeatable = root.listNavRepeats(event)
+                     || root.textEditRepeats(event, mixModalInputMode)
+    if (event.isAutoRepeat && !repeatable) { event.accepted = true; return }
+    // Mirror the List filter's two-tier Esc: while typing a new mix, Esc
+    // clears the box and drops out of input mode (modal stays); from the
+    // browse state, Esc closes the modal.
+    if (event.key === Qt.Key_Escape) {
+      if (mixModalInputMode) {
+        mixModalNewName = ""
+        mixModalInputMode = false
+      } else {
+        closeMixModal()
+      }
+      event.accepted = true
+      return
+    }
+    if (event.text === "m" && !mixModalInputMode) { closeMixModal(); event.accepted = true; return }
+    if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+      if (mixModalInputMode) {
+        addMixTag(mixModalNewName.trim())
+        mixModalNewName = ""
+        mixModalInputMode = false
+      } else if (mixTagList.cursorItem && mixTagList.cursorItem.isNewMix) {
+        mixModalInputMode = true
+      } else if (mixTagList.cursorItem && mixTagList.cursorItem.tag) {
+        toggleMixTag(mixTagList.cursorItem.tag)
+      }
+      event.accepted = true
+      return
+    }
+    if (mixModalInputMode && event.key === Qt.Key_Backspace) {
+      mixModalNewName = mixModalNewName.slice(0, -1); event.accepted = true; return
+    }
+    if (mixModalInputMode && event.text && event.text.length === 1 && event.text >= " ") {
+      mixModalNewName += event.text; event.accepted = true; return
+    }
+    mixTagList.handleKey(event)
+    event.accepted = true
+  }
+
   function closePalette() {
     paletteOpen = false
     Qt.callLater(function() { keyFocus.forceActiveFocus() })
@@ -667,6 +925,12 @@ Panel {
   // Palette key router (shared by the modal's Keys handler and the
   // headless injectKey seam).
   function handlePaletteKey(event) {
+    // Repeat is opt-in: paging, cursor nav and filter typing repeat; Enter
+    // (activation) and everything else is one-shot.
+    var paging = event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown
+    var repeatable = paging || root.listNavRepeats(event)
+                     || root.textEditRepeats(event, paletteList.filtering)
+    if (event.isAutoRepeat && !repeatable) { event.accepted = true; return }
     if (event.key === Qt.Key_PageUp) { paletteList.jumpCursor(paletteList.cursorPos - 8); event.accepted = true; return }
     if (event.key === Qt.Key_PageDown) { paletteList.jumpCursor(paletteList.cursorPos + 8); event.accepted = true; return }
     paletteList.handleKey(event)
@@ -797,20 +1061,22 @@ Panel {
     // Handles every panel-level key. List offers it the keys it did not
     // consume, so global bindings keep working on every tab.
     function handleGlobalKey(event) {
-        if (root.paletteOpen) { event.accepted = true; return }
+        if (root.paletteOpen || root.mixModalOpen) { event.accepted = true; return }
+        // Repeat is opt-in (see listNavRepeats/textEditRepeats): only cursor
+        // nav, seek and filter typing survive auto-repeat; every discrete
+        // action (transport, tier, queue, tab, play/pause, close) is one-shot.
+        var seeking = event.text === "," || event.text === "."
+        var repeatable = root.listNavRepeats(event) || seeking
+                         || root.textEditRepeats(event, mainList.filtering)
+        if (event.isAutoRepeat && !repeatable) { event.accepted = true; return }
         if (mainList.handleKey(event)) { event.accepted = true; return }
         if (root.handleRowKey(event)) { event.accepted = true; return }
         var t = event.text
-        // No key repeat on transport keys: held n/N would queue a burst of
-        // cold network fetches in mpv. j/k and ,/. keep their repeat.
-        var transport = t === "n" || t === "N" || event.key === Qt.Key_Space
-        if (transport && event.isAutoRepeat) { event.accepted = true; return }
         if (event.key === Qt.Key_Escape) {
           root.close(); event.accepted = true; return
         }
         // h is drill-back only (List's backHook handles it): at the top
-        // level it does nothing. Left and Esc are the close keys.
-        if (event.key === Qt.Key_Left) { root.close(); event.accepted = true; return }
+        // level it does nothing. Esc is the close key.
         if (event.key === Qt.Key_Space) { root.togglePlay(); event.accepted = true; return }
         if (t === "s") {
           send({ type: "set_shuffle", on: !(snap.shuffle) })
@@ -828,8 +1094,8 @@ Panel {
         }
         if (t === "n") { root.nextTrack(); event.accepted = true; return }
         if (t === "N") { root.prevTrack(); event.accepted = true; return }
-        if (t === "," && !event.isAutoRepeat) { root.seekBy(-10); event.accepted = true; return }
-        if (t === "." && !event.isAutoRepeat) { root.seekBy(10); event.accepted = true; return }
+        if (t === ",") { root.seekBy(-10); event.accepted = true; return }
+        if (t === ".") { root.seekBy(10); event.accepted = true; return }
         if (t === "F") { root.cycleTierNow(); event.accepted = true; return }
         if (t === "[") { send({ type: "step_filter", up: false }); event.accepted = true; return }
         if (t === "]") { send({ type: "step_filter", up: true }); event.accepted = true; return }
@@ -1026,6 +1292,7 @@ Panel {
           Repeater {
             model: [ { id: "queue", label: "󰐑 Queue" },
                       { id: "albums", label: "󰀥 Albums" },
+                      { id: "mixes", label: "Mixes" },
                       { id: "commands", label: "Commands" } ]
 
             delegate: Rectangle {
@@ -1079,6 +1346,7 @@ Panel {
 
       Component { id: trackRowComp; TrackRow {} }
       Component { id: commandRowComp; CommandRow {} }
+      Component { id: mixRowComp; MixRow {} }
 
       // Queue header: a fixed "Up next" strip above the list, only while
       // there are queued rows. A known-height header (like MetaHeader)
@@ -1140,11 +1408,13 @@ Panel {
         suppressRemap: root.libraryFetching
         emptyText: root.tab === "queue"
           ? "Queue empty — q queues the selected song, p plays it next"
-          : (root.tab === "albums" && albumList.length === 0
-             ? "Loading library…"
-             : (root.tab === "albums" && root.openAlbumId !== "" && !tracksLoaded[root.openAlbumId]
-                ? "Loading…"
-                : "Nothing here"))
+           : (root.tab === "mixes" && root.mixList.length === 0
+              ? "No mixes yet — press m on an album"
+              : (root.tab === "albums" && albumList.length === 0
+              ? "Loading library…"
+              : (root.tab === "albums" && root.openAlbumId !== "" && !tracksLoaded[root.openAlbumId]
+                 ? "Loading…"
+                 : "Nothing here")))
         focusPlayingHook: function() { root.focusPlayingRow() }
         backHook: function() { return root.drillBack() }
         drillHook: function() {
@@ -1170,32 +1440,68 @@ Panel {
         onActivated: item => root.activateRow(item)
       }
 
+      // Album mix editor. Existing tags are rows; typing creates a new
+      // mix name and Enter toggles it on the album.
+      Modal {
+        id: mixModal
+        open: root.mixModalOpen
+        modalHeight: Style.space(360)
+        closeOnEscape: false
+        Keys.onPressed: function(event) { root.handleMixModalKey(event) }
+        onCloseRequested: root.closeMixModal()
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "Mixes for " + ((root.mixModalAlbum && root.mixModalAlbum.title) || "")
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              font.bold: true
+              elide: Text.ElideRight
+            }
+
+            Text {
+              visible: root.mixModalError !== "" || root.mixModalBusyTag !== ""
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.mixModalError !== "" ? root.mixModalError : "writing " + root.mixModalBusyTag + "..."
+              color: root.mixModalError !== "" ? Color.accent : Qt.darker(Color.foreground, 1.4)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+
+            List {
+              id: mixTagList
+              width: parent.width
+              height: Style.space(284)
+              debugName: "mix-modal"
+              rows: root.mixModalRows()
+              filterable: false
+              filterFn: Util.filterByKeyOrDesc
+              rowDelegate: mixRowComp
+              rowHeight: Style.space(42)
+              emptyText: "No existing mixes"
+              backHook: function() { root.closeMixModal(); return true }
+              onActivated: item => {
+                if (item.isNewMix) root.mixModalInputMode = true
+                else if (item.tag) root.toggleMixTag(item.tag)
+              }
+            }
       }
 
       // command palette: dims the panel and floats a navigable list of
       // every keybind. "/" switches to filter mode (input focused); Esc
       // leaves filter mode; Esc/h in navigate mode closes.
-      Rectangle {
-        anchors.fill: parent
-        visible: root.paletteOpen
-        color: Qt.rgba(0, 0, 0, 0.55)
-
-        Rectangle {
-          id: paletteModal
-
-          anchors.centerIn: parent
-          width: parent.width - Style.space(96)
-          height: Style.space(440)
-          radius: Style.cornerRadius
-          color: Color.popups.background
-          border.width: Math.max(1, Style.space(1))
-          border.color: Color.popups.border
-
-          // Everything the shared List doesn't consume is irrelevant to
-          // the palette; PgUp/PgDn page the cursor by 8 as before.
-          Keys.onPressed: function(event) { root.handlePaletteKey(event) }
-
-          onFocusChanged: if (!focus && visible) forceActiveFocus()
+      Modal {
+        id: paletteModal
+        open: root.paletteOpen
+        modalHeight: Style.space(440)
+        // Everything the shared List doesn't consume is irrelevant to
+        // the palette; PgUp/PgDn page the cursor by 8 as before.
+        Keys.onPressed: function(event) { root.handlePaletteKey(event) }
+        onCloseRequested: root.closePalette()
 
           // Same component as the main views: prompt, live filter (1 char
           // matches keybinds, longer text matches descriptions), cursor,
@@ -1203,8 +1509,8 @@ Panel {
           // Enter closes it (activation is display-only here).
           List {
             id: paletteList
-            anchors.fill: parent
-            anchors.margins: Style.space(12)
+            width: parent.width
+            height: Style.space(416)
             debugName: "palette"
             rows: root.paletteRows
             filterable: true
@@ -1215,7 +1521,8 @@ Panel {
             backHook: function() { root.closePalette(); return true }
             onActivated: item => root.closePalette()
           }
-        }
+      }
+
       }
     }
   }

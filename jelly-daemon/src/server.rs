@@ -233,12 +233,24 @@ fn handle_client_msg(
             let _ = cmd_tx.send(AppCommand::Login);
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
-        ClientKind::Play { tracks, start_index, clear_queue } => {
-            let _ = cmd_tx.send(AppCommand::Play { tracks, start_index, clear_queue });
+        ClientKind::Play {
+            tracks,
+            start_index,
+            clear_queue,
+        } => {
+            let _ = cmd_tx.send(AppCommand::Play {
+                tracks,
+                start_index,
+                clear_queue,
+            });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::PlayAlbum { album_id } => {
             let _ = cmd_tx.send(AppCommand::PlayAlbum { album_id, req_id });
+            vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
+        }
+        ClientKind::PlayMix { tag } => {
+            let _ = cmd_tx.send(AppCommand::PlayMix { tag, req_id });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::Pause => {
@@ -290,7 +302,11 @@ fn handle_client_msg(
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::MoveQueue { index, delta } => {
-            let _ = cmd_tx.send(AppCommand::MoveQueue { index, delta, req_id });
+            let _ = cmd_tx.send(AppCommand::MoveQueue {
+                index,
+                delta,
+                req_id,
+            });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::ToggleFavorite { item_id } => {
@@ -298,11 +314,28 @@ fn handle_client_msg(
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::SetTier { item_id, tier } => {
-            let _ = cmd_tx.send(AppCommand::SetTier { item_id, tier, req_id });
+            let _ = cmd_tx.send(AppCommand::SetTier {
+                item_id,
+                tier,
+                req_id,
+            });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::CycleTier { item_id } => {
             let _ = cmd_tx.send(AppCommand::CycleTier { item_id, req_id });
+            vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
+        }
+        ClientKind::ToggleTag {
+            album_id,
+            tag,
+            present,
+        } => {
+            let _ = cmd_tx.send(AppCommand::ToggleTag {
+                album_id,
+                tag,
+                present,
+                req_id,
+            });
             vec![DaemonMessage::new(DaemonKind::Ack, req_id)]
         }
         ClientKind::SetFilter { filter } => {

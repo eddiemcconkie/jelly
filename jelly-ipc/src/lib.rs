@@ -93,7 +93,11 @@ impl TierFilter {
         use TierFilter::*;
         let order = [All, Liked, Loved, Favorite];
         let i = order.iter().position(|f| *f == self).unwrap_or(0);
-        let j = if up { (i + 1).min(order.len() - 1) } else { i.saturating_sub(1) };
+        let j = if up {
+            (i + 1).min(order.len() - 1)
+        } else {
+            i.saturating_sub(1)
+        };
         order[j]
     }
 }
@@ -140,7 +144,13 @@ pub enum ClientKind {
     },
     /// Play an album without the client needing its track list: the daemon
     /// fetches the album's tracks itself and starts at track 0.
-    PlayAlbum { album_id: String },
+    PlayAlbum {
+        album_id: String,
+    },
+    /// Play every audio item carrying a Jellyfin tag/mix.
+    PlayMix {
+        tag: String,
+    },
     Pause,
     Resume,
     TogglePlay,
@@ -153,51 +163,92 @@ pub enum ClientKind {
     /// repeat-all edge wrap; never mutates the queue.
     Prev,
     /// Seek to an absolute position in seconds.
-    Seek { position_secs: f64 },
+    Seek {
+        position_secs: f64,
+    },
     /// Volume 0..=100.
-    SetVolume { volume: u8 },
+    SetVolume {
+        volume: u8,
+    },
     /// Full snapshot of playback + context + queue.
     GetState,
     // --- Browse (typed views, lazy fetch; no pagination in v1) ---
     /// One request: every album in the library.
     BrowseAlbums,
     /// Tracks on an album.
-    BrowseTracks { album_id: String },
+    BrowseTracks {
+        album_id: String,
+    },
     /// The user's playlists.
     BrowsePlaylists,
     /// Items of one playlist.
-    BrowsePlaylistTracks { playlist_id: String },
+    BrowsePlaylistTracks {
+        playlist_id: String,
+    },
+    /// Toggle one tag/mix on an album.
+    ToggleTag {
+        album_id: String,
+        tag: String,
+        #[serde(default)]
+        present: Option<bool>,
+    },
     // --- Queue editing (the queue only; the context is immutable) ---
     /// Append tracks to the tail of the queue (starts playing if stopped
     /// and nothing else is queued).
-    Enqueue { items: Vec<TrackMeta> },
+    Enqueue {
+        items: Vec<TrackMeta>,
+    },
     /// Insert one track at the head of the queue (plays next).
-    PlayNext { item: TrackMeta },
+    PlayNext {
+        item: TrackMeta,
+    },
     /// Jump to a waiting queue item; earlier waiting items are consumed.
-    JumpTo { index: usize },
+    JumpTo {
+        index: usize,
+    },
     /// Remove the waiting queue item at `index`.
-    RemoveFromQueue { index: usize },
+    RemoveFromQueue {
+        index: usize,
+    },
     /// Move the waiting queue item at `index` by -1 or +1 (clamped).
-    MoveQueue { index: usize, delta: i32 },
-    SetRepeat { mode: RepeatMode },
+    MoveQueue {
+        index: usize,
+        delta: i32,
+    },
+    SetRepeat {
+        mode: RepeatMode,
+    },
     /// Toggles a fixed permutation of the context order only.
-    SetShuffle { on: bool },
+    SetShuffle {
+        on: bool,
+    },
     /// DEPRECATED (superseded by `SetTier`/`CycleTier`, JELLY-39): the
     /// favorite flag is now write-side only — Favorite tier hearts the
     /// item for other clients, nothing in our UI renders favorites.
     /// Kept one release for compatibility.
-    ToggleFavorite { item_id: String },
+    ToggleFavorite {
+        item_id: String,
+    },
     /// Set a track's tier (synchronous server write; the command fails
     /// and nothing changes while the server is unreachable). Favorite
     /// also drives the native favorite flag; every other tier clears it.
-    SetTier { item_id: String, tier: Tier },
+    SetTier {
+        item_id: String,
+        tier: Tier,
+    },
     /// Cycle the track's tier (unrated→liked→loved→favorite→unrated).
     /// The current tier comes from the daemon's tier map.
-    CycleTier { item_id: String },
+    CycleTier {
+        item_id: String,
+    },
     /// Set the global playback filter directly.
-    SetFilter { filter: TierFilter },
+    SetFilter {
+        filter: TierFilter,
+    },
     /// Step the global filter: up = toward Favorite, down = toward All.
-    StepFilter { up: bool },
+    StepFilter {
+        up: bool,
+    },
 }
 
 /// Daemon → client envelope: one of `DaemonKind` plus `req_id` echoed
@@ -221,12 +272,19 @@ impl DaemonMessage {
 pub enum DaemonKind {
     Pong,
     /// Reply to `Hello`: protocol version + current library revision.
-    Welcome { version: u32, library_rev: u64 },
-    AuthStatus { status: AuthStatus },
+    Welcome {
+        version: u32,
+        library_rev: u64,
+    },
+    AuthStatus {
+        status: AuthStatus,
+    },
     /// Full snapshot, sent in reply to `GetState` and on every change.
     State(Box<PlaybackSnapshot>),
     /// Small increment used for high-frequency position updates.
-    Position { position_secs: f64 },
+    Position {
+        position_secs: f64,
+    },
     /// Reply to any `Browse*` request.
     Browse {
         items: Vec<BrowseItem>,
@@ -234,7 +292,16 @@ pub enum DaemonKind {
     },
     /// Confirmation that a state-changing command was accepted.
     Ack,
-    Error { code: ErrorCode, message: String },
+    /// Successful album tag write; clients update checked state only on
+    /// this message, not on the immediate command Ack.
+    TagUpdate {
+        album_id: String,
+        tags: Vec<String>,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 /// Coded errors so clients can branch without parsing messages.
@@ -268,6 +335,8 @@ pub struct BrowseItem {
     pub duration_secs: Option<f64>,
     #[serde(default)]
     pub image_url: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,6 +441,9 @@ pub struct PlaybackSnapshot {
     /// The active global playback filter (walk-time minimum tier).
     #[serde(default)]
     pub filter: TierFilter,
+    /// All known album tags/mixes, aggregated from the album browse list.
+    #[serde(default)]
+    pub mixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -401,6 +473,7 @@ impl Default for PlaybackSnapshot {
             favorite_ids: Vec::new(),
             tiers: BTreeMap::new(),
             filter: TierFilter::default(),
+            mixes: Vec::new(),
         }
     }
 }
@@ -439,18 +512,24 @@ mod tests {
     #[test]
     fn play_clear_queue_defaults_false_and_parses_true() {
         let back: ClientMessage =
-            serde_json::from_str("{\"type\":\"play\",\"tracks\":[],\"start_index\":3}")
-                .unwrap();
+            serde_json::from_str("{\"type\":\"play\",\"tracks\":[],\"start_index\":3}").unwrap();
         assert_eq!(
             back.kind,
-            ClientKind::Play { tracks: vec![], start_index: 3, clear_queue: false }
+            ClientKind::Play {
+                tracks: vec![],
+                start_index: 3,
+                clear_queue: false
+            }
         );
         let back: ClientMessage =
-            serde_json::from_str("{\"type\":\"play\",\"tracks\":[],\"clear_queue\":true}")
-                .unwrap();
+            serde_json::from_str("{\"type\":\"play\",\"tracks\":[],\"clear_queue\":true}").unwrap();
         assert_eq!(
             back.kind,
-            ClientKind::Play { tracks: vec![], start_index: 0, clear_queue: true }
+            ClientKind::Play {
+                tracks: vec![],
+                start_index: 0,
+                clear_queue: true
+            }
         );
     }
 
@@ -487,6 +566,7 @@ mod tests {
                     detail: "Artist".into(),
                     duration_secs: None,
                     image_url: None,
+                    tags: vec![],
                 }],
                 library_rev: 7,
             },
@@ -499,7 +579,13 @@ mod tests {
 
     #[test]
     fn welcome_has_version_shape() {
-        let msg = DaemonMessage::new(DaemonKind::Welcome { version: 1, library_rev: 0 }, None);
+        let msg = DaemonMessage::new(
+            DaemonKind::Welcome {
+                version: 1,
+                library_rev: 0,
+            },
+            None,
+        );
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"welcome\""));
         assert!(json.contains("\"version\":1"));
@@ -528,7 +614,13 @@ mod tests {
 
     #[test]
     fn move_queue_command_round_trips() {
-        let msg = ClientMessage::new(ClientKind::MoveQueue { index: 2, delta: -1 }, Some(9));
+        let msg = ClientMessage::new(
+            ClientKind::MoveQueue {
+                index: 2,
+                delta: -1,
+            },
+            Some(9),
+        );
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"move_queue\""));
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -570,7 +662,12 @@ mod tests {
 
     #[test]
     fn toggle_favorite_round_trips() {
-        let msg = ClientMessage::new(ClientKind::ToggleFavorite { item_id: "t1".into() }, Some(5));
+        let msg = ClientMessage::new(
+            ClientKind::ToggleFavorite {
+                item_id: "t1".into(),
+            },
+            Some(5),
+        );
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"toggle_favorite\""));
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -634,7 +731,9 @@ mod tests {
         assert_eq!(back, msg);
 
         let msg = ClientMessage::new(
-            ClientKind::CycleTier { item_id: "t2".into() },
+            ClientKind::CycleTier {
+                item_id: "t2".into(),
+            },
             None,
         );
         let json = serde_json::to_string(&msg).unwrap();
@@ -654,6 +753,7 @@ mod tests {
         let back: PlaybackSnapshot = serde_json::from_str("{\"status\":\"stopped\",\"position_secs\":0,\"volume\":100,\"shuffle\":false,\"repeat\":\"off\"}").unwrap();
         assert!(back.tiers.is_empty());
         assert_eq!(back.filter, TierFilter::All);
+        assert!(back.mixes.is_empty());
     }
 
     #[test]
@@ -686,7 +786,12 @@ mod tests {
 
     #[test]
     fn filter_commands_round_trip() {
-        let msg = ClientMessage::new(ClientKind::SetFilter { filter: TierFilter::Loved }, Some(4));
+        let msg = ClientMessage::new(
+            ClientKind::SetFilter {
+                filter: TierFilter::Loved,
+            },
+            Some(4),
+        );
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"set_filter\""));
         assert!(json.contains("\"filter\":\"loved\""));
@@ -695,5 +800,31 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"step_filter\""));
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn mix_commands_and_fields_round_trip() {
+        let msg = ClientMessage::new(ClientKind::PlayMix { tag: "Road".into() }, Some(8));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"play_mix\""));
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+
+        let msg = ClientMessage::new(
+            ClientKind::ToggleTag {
+                album_id: "a1".into(),
+                tag: "Road".into(),
+                present: Some(true),
+            },
+            Some(9),
+        );
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"toggle_tag\""));
+        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
+
+        let mut snap = PlaybackSnapshot::default();
+        snap.mixes = vec!["Road".into()];
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: PlaybackSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mixes, vec!["Road".to_string()]);
     }
 }

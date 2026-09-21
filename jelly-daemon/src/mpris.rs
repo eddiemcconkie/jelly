@@ -40,11 +40,7 @@ impl MprisHandle {
                 PATH,
                 PROPS_IFACE,
                 "PropertiesChanged",
-                &(
-                    PLAYER_IFACE.to_string(),
-                    changed,
-                    Vec::<String>::new(),
-                ),
+                &(PLAYER_IFACE.to_string(), changed, Vec::<String>::new()),
             )
             .await
     }
@@ -153,17 +149,17 @@ fn metadata_map(snap: &PlaybackSnapshot) -> HashMap<String, Value<'static>> {
             map.insert("mpris:artUrl".to_string(), Value::from(url.clone()));
         }
         if let Some(d) = track.duration_secs {
-            map.insert("mpris:length".to_string(), Value::I64((d * 1_000_000.0) as i64));
+            map.insert(
+                "mpris:length".to_string(),
+                Value::I64((d * 1_000_000.0) as i64),
+            );
         }
     }
     map
 }
 
 fn metadata_value(snap: &PlaybackSnapshot) -> Value<'static> {
-    let mut dict = Dict::new(
-        <String as Type>::SIGNATURE,
-        <Value as Type>::SIGNATURE,
-    );
+    let mut dict = Dict::new(<String as Type>::SIGNATURE, <Value as Type>::SIGNATURE);
     for (k, v) in metadata_map(snap) {
         // Dict value signature is "v", so inner values must be boxed in a
         // Value::Value (otherwise the object-path/string entries mismatch).
@@ -234,12 +230,12 @@ impl Player {
     fn seek(&self, offset: i64) {
         let snap = state::snapshot(&self.rx);
         let pos = snap.position_secs + offset as f64 / 1_000_000.0;
-        let _ = self
-            .cmd_tx
-            .send(AppCommand::Seek(pos.max(0.0)));
+        let _ = self.cmd_tx.send(AppCommand::Seek(pos.max(0.0)));
     }
     fn set_position(&self, _track_id: ObjectPath<'_>, position: i64) {
-        let _ = self.cmd_tx.send(AppCommand::Seek(position as f64 / 1_000_000.0));
+        let _ = self
+            .cmd_tx
+            .send(AppCommand::Seek(position as f64 / 1_000_000.0));
     }
     fn open_uri(&self, _uri: String) {}
 

@@ -29,6 +29,8 @@
   art and the like) so surrounding content adapts when those change.
 
 ## Daemon
+- After changing Rust code, run `cargo fmt` before testing so formatting-only
+  diffs do not surprise the next pass.
 - The daemon's lifecycle belongs to the plugin: `Service.qml` spawns
   `target/debug/jelly-daemon` (with stdout/stderr piped into the shell journal,
   prefixed `jelly-daemon:`), respawns it 2s after death, and rbw-locked agents

@@ -16,11 +16,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (kind, req_id) = build_message(&args);
     let msg = ClientMessage::new(kind, req_id);
-    let path = std::env::var("JELLY_SOCK")
-        .unwrap_or_else(|_| {
-            let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-            format!("{runtime}/jelly/daemon.sock")
-        });
+    let path = std::env::var("JELLY_SOCK").unwrap_or_else(|_| {
+        let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        format!("{runtime}/jelly/daemon.sock")
+    });
     let mut stream = UnixStream::connect(&path).expect("connect to daemon socket");
 
     let line = serde_json::to_string(&msg).unwrap();
@@ -67,7 +66,11 @@ fn build_message(args: &[String]) -> (ClientKind, Option<u64>) {
         Some("state") => (K::GetState, req_id),
         Some("play") => (
             K::Play {
-                tracks: args.iter().skip(1).map(|id| track_placeholder(id)).collect(),
+                tracks: args
+                    .iter()
+                    .skip(1)
+                    .map(|id| track_placeholder(id))
+                    .collect(),
                 start_index: 0,
                 clear_queue: false,
             },
@@ -99,6 +102,20 @@ fn build_message(args: &[String]) -> (ClientKind, Option<u64>) {
             req_id,
         ),
         Some("playlists") => (K::BrowsePlaylists, req_id),
+        Some("mix") => (
+            K::PlayMix {
+                tag: args.get(1).cloned().unwrap_or_default(),
+            },
+            req_id,
+        ),
+        Some("tag") => (
+            K::ToggleTag {
+                album_id: args.get(1).cloned().unwrap_or_default(),
+                tag: args.get(2).cloned().unwrap_or_default(),
+                present: args.get(3).map(|s| s != "off"),
+            },
+            req_id,
+        ),
         Some("pltracks") => (
             K::BrowsePlaylistTracks {
                 playlist_id: args.get(1).cloned().unwrap_or_default(),
@@ -107,7 +124,11 @@ fn build_message(args: &[String]) -> (ClientKind, Option<u64>) {
         ),
         Some("enqueue") => (
             K::Enqueue {
-                items: args.iter().skip(1).map(|id| track_placeholder(id)).collect(),
+                items: args
+                    .iter()
+                    .skip(1)
+                    .map(|id| track_placeholder(id))
+                    .collect(),
             },
             req_id,
         ),

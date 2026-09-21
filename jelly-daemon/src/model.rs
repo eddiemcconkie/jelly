@@ -26,7 +26,12 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(name: impl Into<String>, artist: impl Into<String>, image_url: Option<String>, tracks: Vec<TrackMeta>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        artist: impl Into<String>,
+        image_url: Option<String>,
+        tracks: Vec<TrackMeta>,
+    ) -> Self {
         Self {
             name: name.into(),
             artist: artist.into(),
@@ -158,9 +163,7 @@ impl PlaybackModel {
             return Transition::Stop;
         }
         let span = if wrap { len } else { len - start };
-        let found = (0..span).find(|&k| {
-            ctx.track_at((start + k) % len).is_some_and(|t| pass(t))
-        });
+        let found = (0..span).find(|&k| ctx.track_at((start + k) % len).is_some_and(|t| pass(t)));
         match found {
             Some(k) => {
                 let next_pos = (start + k) % len;
@@ -248,7 +251,9 @@ impl PlaybackModel {
     /// restores the original order, keeping the playing track current.
     pub fn set_shuffle(&mut self, on: bool) {
         self.shuffle = on;
-        let Some(ctx) = self.context.as_mut() else { return };
+        let Some(ctx) = self.context.as_mut() else {
+            return;
+        };
         if on {
             let playing_track_idx = ctx.pos.and_then(|p| ctx.order.get(p).copied());
             let perm = shuffle_order(ctx.tracks.len(), shuffle_seed());
@@ -305,7 +310,11 @@ impl PlaybackModel {
     /// Move waiting item `index` by `delta` slots, clamped.
     pub fn move_item(&mut self, index: usize, delta: i32) -> bool {
         let target = index as i32 + delta;
-        if index >= self.queue.len() || target < 0 || target >= self.queue.len() as i32 || delta == 0 {
+        if index >= self.queue.len()
+            || target < 0
+            || target >= self.queue.len() as i32
+            || delta == 0
+        {
             return false;
         }
         let item = self.queue.remove(index);
@@ -382,12 +391,24 @@ mod tests {
     }
 
     fn ctx(tracks: &[&str]) -> Context {
-        Context::new("Album", "Artist", None, tracks.iter().map(|t| track(t)).collect())
+        Context::new(
+            "Album",
+            "Artist",
+            None,
+            tracks.iter().map(|t| track(t)).collect(),
+        )
     }
 
     fn model(tracks: &[&str], start: usize) -> (PlaybackModel, Vec<TrackMeta>) {
         let mut m = PlaybackModel::new();
-        m.set_context("Album", "Artist", None, tracks.iter().map(|t| track(t)).collect(), start, false);
+        m.set_context(
+            "Album",
+            "Artist",
+            None,
+            tracks.iter().map(|t| track(t)).collect(),
+            start,
+            false,
+        );
         let seq = vec![track(tracks[start])];
         (m, seq)
     }
@@ -446,9 +467,15 @@ mod tests {
     fn next_with_skips_non_matching_forward() {
         let (mut m, _) = model(&["1", "2", "3", "4"], 0);
         // Only "3" and "4" pass: from pos 0 the walk jumps over "2".
-        assert_eq!(m.next_with(&only(&["3", "4"])), Transition::Play(track("3")));
+        assert_eq!(
+            m.next_with(&only(&["3", "4"])),
+            Transition::Play(track("3"))
+        );
         assert_eq!(m.context.as_ref().unwrap().pos, Some(2));
-        assert_eq!(m.next_with(&only(&["3", "4"])), Transition::Play(track("4")));
+        assert_eq!(
+            m.next_with(&only(&["3", "4"])),
+            Transition::Play(track("4"))
+        );
     }
 
     #[test]
@@ -482,7 +509,10 @@ mod tests {
         let (mut m, _) = model(&["1", "2"], 0);
         m.enqueue(vec![track("q1")]);
         // Predicate admits nothing in the context; the queue still plays.
-        assert_eq!(m.next_with(&only::<&str>(&[])), Transition::Play(track("q1")));
+        assert_eq!(
+            m.next_with(&only::<&str>(&[])),
+            Transition::Play(track("q1"))
+        );
         // Then continuation into the context applies the predicate.
         assert_eq!(m.next_with(&only::<&str>(&[])), Transition::Stop);
     }
@@ -651,7 +681,10 @@ mod tests {
         assert!(m.move_item(2, 1) == false); // clamped at the tail
         assert!(m.move_item(0, -1) == false); // clamped at the head
         assert!(m.move_item(2, -1));
-        assert_eq!(m.queue.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec!["q1", "q3", "q2"]);
+        assert_eq!(
+            m.queue.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["q1", "q3", "q2"]
+        );
         assert_eq!(m.remove(1).unwrap(), track("q3"));
         assert_eq!(m.remove(5), None);
     }
