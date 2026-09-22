@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
         tiers: Default::default(),
         filter: Default::default(),
         mixes: Vec::new(),
+        mix_cache: Default::default(),
         session_tx,
         position_secs: 0.0,
         duration_secs: None,

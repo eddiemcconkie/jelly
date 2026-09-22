@@ -13,6 +13,7 @@ use jelly_ipc::{
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -166,6 +167,12 @@ pub struct Coordinator {
     pub filter: jelly_ipc::TierFilter,
     /// All known album tags/mixes, aggregated from the album browse list.
     pub mixes: Vec<String>,
+    /// Resolved mix track lists, keyed by mix label. A `tags=…&recursive`
+    /// scan is the slow path (Jellyfin does not index tags), so a mix's
+    /// full ordered track list is cached after first play. Entries are
+    /// dropped on tag writes (membership change) and on a full album
+    /// browse (library reload), so the cache never outlives the truth.
+    pub mix_cache: HashMap<String, Vec<jelly_ipc::TrackMeta>>,
     /// Publishes the websocket session (token + user) for the session
     /// listener; `None` parks it (logout / failed login).
     pub session_tx: tokio::sync::watch::Sender<Option<crate::session::Session>>,
@@ -581,6 +588,9 @@ impl Coordinator {
         }
         match self.client.set_album_mix_tag(album_id, tag, present).await {
             Ok(tags) => {
+                // Membership for this mix just changed: drop its cached
+                // track list so the next play re-resolves against the truth.
+                self.mix_cache.remove(tag);
                 if let Ok(albums) = self.client.all_albums().await {
                     self.refresh_mixes_from_albums(&albums);
                 }
@@ -704,45 +714,52 @@ impl Coordinator {
             tracing::warn!("play_mix before authentication; send login first");
             return;
         }
-        let items = match self.client.tracks_for_tag(tag).await {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = self.broadcast_tx.send(DaemonMessage::new(
-                    DaemonKind::Error {
-                        code: ErrorCode::Internal,
-                        message: format!("mix fetch failed: {e:#}"),
-                    },
-                    req_id,
-                ));
-                return;
+        let tracks: Vec<TrackMeta> = match self.mix_cache.get(tag).cloned() {
+            Some(v) => v,
+            None => {
+                let items = match self.client.tracks_for_tag(tag).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = self.broadcast_tx.send(DaemonMessage::new(
+                            DaemonKind::Error {
+                                code: ErrorCode::Internal,
+                                message: format!("mix fetch failed: {e:#}"),
+                            },
+                            req_id,
+                        ));
+                        return;
+                    }
+                };
+                let built: Vec<TrackMeta> = items
+                    .iter()
+                    .map(|it| TrackMeta {
+                        id: it.id.clone(),
+                        name: it.name.clone(),
+                        artist: it
+                            .album_artist
+                            .clone()
+                            .or_else(|| it.artists.as_ref().and_then(|a| a.first().cloned()))
+                            .unwrap_or_default(),
+                        album: it.album_id.clone().unwrap_or_default(),
+                        duration_secs: it.run_time_ticks.map(|t| t as f64 / 10_000_000.0),
+                        image_url: self.client.image_url(it),
+                        stream_url: String::new(),
+                    })
+                    .collect();
+                if built.is_empty() {
+                    let _ = self.broadcast_tx.send(DaemonMessage::new(
+                        DaemonKind::Error {
+                            code: ErrorCode::NotFound,
+                            message: format!("mix '{tag}' has no tracks"),
+                        },
+                        req_id,
+                    ));
+                    return;
+                }
+                self.mix_cache.insert(tag.to_string(), built.clone());
+                built
             }
         };
-        let tracks: Vec<TrackMeta> = items
-            .iter()
-            .map(|it| TrackMeta {
-                id: it.id.clone(),
-                name: it.name.clone(),
-                artist: it
-                    .album_artist
-                    .clone()
-                    .or_else(|| it.artists.as_ref().and_then(|a| a.first().cloned()))
-                    .unwrap_or_default(),
-                album: it.album_id.clone().unwrap_or_default(),
-                duration_secs: it.run_time_ticks.map(|t| t as f64 / 10_000_000.0),
-                image_url: self.client.image_url(it),
-                stream_url: String::new(),
-            })
-            .collect();
-        if tracks.is_empty() {
-            let _ = self.broadcast_tx.send(DaemonMessage::new(
-                DaemonKind::Error {
-                    code: ErrorCode::NotFound,
-                    message: format!("mix '{tag}' has no tracks"),
-                },
-                req_id,
-            ));
-            return;
-        }
         let start_index = if self.filter == jelly_ipc::TierFilter::All {
             0
         } else {
@@ -819,6 +836,9 @@ impl Coordinator {
             Ok(items) => {
                 if matches!(kind, ClientKind::BrowseAlbums) {
                     self.refresh_mixes_from_albums(&items);
+                    // A full library reload can move any mix's membership;
+                    // drop every cached track list so plays re-resolve.
+                    self.mix_cache.clear();
                 }
                 let items = items
                     .into_iter()
