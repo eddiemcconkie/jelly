@@ -3,6 +3,7 @@
 // The UI keeps no playback state — only a navigation cursor, which starts
 // at the top of every view; o jumps to the playing track.
 import QtQuick
+import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -32,9 +33,10 @@ Panel {
     var key = keys[name] !== undefined ? keys[name] : 0
     var text = name.length === 1 ? name : ""
     var ev = { key: key, text: text, isAutoRepeat: false, accepted: false }
-    // Mirror the real focus path: while the palette is open keys land on
-    // the modal, not the panel router.
-    if (mixModalOpen) handleMixModalKey(ev)
+    // Mirror the real focus path: while a modal is open keys land on the
+    // modal router, not the panel router.
+    if (deleteConfirmOpen) handleDeleteConfirmKey(ev)
+    else if (mixModalOpen) handleMixModalKey(ev)
     else if (paletteOpen) handlePaletteKey(ev)
     else panel.handleGlobalKey(ev)
   }
@@ -279,10 +281,9 @@ Panel {
               var tagReq = root.pendingTagReqs[msg.req_id]
               if (tagReq && root.pendingTagReqsByAlbum[tagReq.albumId] === msg.req_id) {
                 root.applyAlbumTags(tagReq.albumId, tagReq.prevTags || [])
-                root.mixModalError = msg.message || "tag write failed"
-                root.mixModalBusyTag = ""
                 delete root.pendingTagReqsByAlbum[tagReq.albumId]
                 delete root.pendingTagReqs[msg.req_id]
+                root.tickMixBatch(msg.req_id, true)
               }
               if (root.pendingAlbumPlayRaw !== "" && (msg.message || "").indexOf("no ") === 0) {
                 root.flashRow(root.pendingAlbumPlayRaw, msg.message)
@@ -401,8 +402,7 @@ Panel {
     console.info("jelly: accept tag_update req", reqId, "album", albumId, "tags", JSON.stringify(tags))
     delete pendingTagReqsByAlbum[albumId]
     delete pendingTagReqs[reqId]
-    mixModalBusyTag = ""
-    mixModalError = ""
+    tickMixBatch(reqId, false)
   }
 
   function uniqueNames(names) {
@@ -450,7 +450,6 @@ Panel {
       break
     }
     albumList = next
-    if (mixModalAlbum && mixModalAlbum.id === albumId) mixModalAlbum = albumById(albumId)
   }
 
   function viewRows() {
@@ -531,7 +530,10 @@ Panel {
       })
     }
     if (tab === "mixes") {
-      return mixList.map(function(tag) {
+      var mixRows = [{ raw: "newmix", isNewMix: true, title: "󰐕 New Mix", artist: "", sub: "",
+                       covers: [], coverCount: 0, cover: "", showCover: false, showGlyph: false,
+                       bold: true, section: "" }]
+      return mixRows.concat(mixList.map(function(tag) {
         var al = mixAlbums(tag)
         var covers = []
         for (var i = 0; i < al.length && covers.length < 10; i++) {
@@ -541,7 +543,7 @@ Panel {
         return { raw: "mix:" + tag, isMix: true, title: tag, artist: "", sub: albumCountText(al.length),
                  covers: covers, coverCount: al.length,
                  cover: "", showCover: false, showGlyph: false, section: "" }
-      })
+      }))
     }
     return []
   }
@@ -580,10 +582,13 @@ Panel {
         startPlayback(item.metas, item.ctxIndex, true); return
       }
     }
-    if (tab === "mixes" && item.isMix) {
-      pendingAlbumPlayRaw = item.raw
-      send({ type: "play_mix", tag: item.title })
-      return
+    if (tab === "mixes") {
+      if (item.isNewMix) { openMixCreate(); return }
+      if (item.isMix) {
+        pendingAlbumPlayRaw = item.raw
+        send({ type: "play_mix", tag: item.title })
+        return
+      }
     }
   }
 
@@ -649,7 +654,8 @@ Panel {
     if (t === "q") { rowAction("queue", item); return true }
     if (t === "p") { rowAction("next", item); return true }
     if (t === "f") { rowAction("tier", item); return true }
-    if (t === "m" && tab === "albums" && item.isAlbum) { openMixModal(item.albumId); return true }
+    if (t === "e" && tab === "mixes" && item.isMix) { openMixEdit(item.title); return true }
+    if (t === "d" && tab === "mixes" && item.isMix) { openMixDelete(item.title); return true }
     var inQueue = item.queueIndex !== undefined && item.queueIndex !== null
     if (t === "d" && inQueue) {
       send({ type: "remove_from_queue", index: item.queueIndex }); return true
@@ -733,12 +739,25 @@ Panel {
   //      same List component as the main views so cursor/scroll/filter
   //      behavior is identical everywhere.
   property bool paletteOpen: false
+  // ---- mix modal (mix-centric, two-step). Launched from the Mixes tab:
+  //      create = name step -> album checklist; edit = album checklist with
+  //      the current members pre-checked (name locked, no rename). Selection
+  //      is desired membership (albumId -> true); the delta against the mix's
+  //      live membership is written on submit as concurrent tag toggles.
   property bool mixModalOpen: false
-  property var mixModalAlbum: null
-  property bool mixModalInputMode: false
-  property string mixModalNewName: ""
-  property string mixModalError: ""
-  property string mixModalBusyTag: ""
+  property string mixStep: "name"        // "name" | "albums"
+  property string mixMode: "create"      // "create" | "edit"
+  property string mixName: ""
+  property var mixSelected: ({})
+  // Concurrent-write tally: reconcile partial failures once every issued
+  // toggle_tag has echoed (or errored) back.
+  property int mixBatchTotal: 0
+  property int mixBatchDone: 0
+  property int mixBatchFailed: 0
+  property var mixBatchReqs: ({})
+  // Delete confirmation (mixes tab `d`).
+  property bool deleteConfirmOpen: false
+  property string deleteMixName: ""
 
   readonly property var commands: [
     { key: "j", desc: "Move cursor down" },
@@ -755,11 +774,11 @@ Panel {
     { key: "/", desc: "Filter the current view" },
     { key: "q", desc: "Queue selection at tail of queue" },
     { key: "p", desc: "Queue selection to play next (head)" },
-    { key: "d", desc: "Remove selected queue item" },
+    { key: "d", desc: "Delete queue item / selected mix" },
     { key: "J", desc: "Move queue item down" },
     { key: "K", desc: "Move queue item up" },
     { key: "f", desc: "Cycle tier on selection" },
-    { key: "m", desc: "Edit album mixes" },
+    { key: "e", desc: "Edit selected mix (albums)" },
     { key: "F", desc: "Cycle tier on playing song" },
     { key: "[", desc: "Step playback filter down (toward All)" },
     { key: "]", desc: "Step playback filter up (toward Favorite)" },
@@ -788,15 +807,26 @@ Panel {
     })
   }
 
-  function openMixModal(albumId) {
-    mixModalAlbum = albumById(albumId)
-    if (!mixModalAlbum) return
-    mixModalInputMode = false
-    mixModalNewName = ""
-    mixModalError = ""
-    mixModalBusyTag = ""
+  // ---- mix modal: entry points ------------------------------------------
+  // Create: name step first, then an all-album checklist starting empty.
+  function openMixCreate() {
+    mixMode = "create"
+    mixStep = "name"
+    mixName = ""
+    mixSelected = ({})
     mixModalOpen = true
-    Qt.callLater(function() { mixTagList.resetCursor(); mixModal.forceActiveFocus() })
+    Qt.callLater(function() { mixModal.forceActiveFocus() })
+  }
+
+  // Edit: name is locked, so skip the name step and open the checklist with
+  // the mix's current members pre-checked.
+  function openMixEdit(tag) {
+    mixMode = "edit"
+    mixStep = "albums"
+    mixName = tag
+    mixSelected = currentMixMembership(tag)
+    mixModalOpen = true
+    Qt.callLater(function() { mixAlbumList.resetCursor(); mixModal.forceActiveFocus() })
   }
 
   function closeMixModal() {
@@ -804,28 +834,240 @@ Panel {
     Qt.callLater(function() { keyFocus.forceActiveFocus() })
   }
 
-  function mixModalRows() {
-    var tags = {}
-    var alTags = (mixModalAlbum && mixModalAlbum.tags) || []
-    for (var i = 0; i < alTags.length; i++) tags[alTags[i]] = true
-    for (var j = 0; j < mixList.length; j++) tags[mixList[j]] = true
-    var names = Object.keys(tags).sort(function(a, b) { return a.toLowerCase() < b.toLowerCase() ? -1 : 1 })
-    var rows = [{
-      raw: "new",
-      checkbox: "+",
-      desc: mixModalInputMode ? mixModalNewName : "New Mix",
-      inputMode: mixModalInputMode,
-      isNewMix: true,
-      section: ""
-    }]
-    for (var n = 0; n < names.length; n++) {
-      var tag = names[n]
-      var selected = hasMixTag(alTags, tag)
-      var count = mixAlbumCount(tag)
-      rows.push({ raw: "tag:" + tag, checkbox: (selected ? "󰄲" : "󰄱"), desc: tag, tag: tag,
-                  selected: selected, albumCount: count, albumCountText: albumCountText(count), section: "" })
+  function mixNameExists(nm) {
+    var w = (nm || "").toLowerCase()
+    if (w === "") return false
+    for (var i = 0; i < mixList.length; i++) if ((mixList[i] || "").toLowerCase() === w) return true
+    return false
+  }
+
+  // Current membership of a mix as an albumId -> true map (case-insensitive
+  // on the tag), read live from the album list so it reflects the truth
+  // (including optimistic writes) at the moment we compare.
+  function currentMixMembership(tag) {
+    var m = ({})
+    if (!tag) return m
+    for (var i = 0; i < albumList.length; i++)
+      if (hasMixTag(albumList[i].tags || [], tag)) m[albumList[i].id] = true
+    return m
+  }
+
+  function memberAlbumIds(tag) {
+    var ids = []
+    if (!tag) return ids
+    for (var i = 0; i < albumList.length; i++)
+      if (hasMixTag(albumList[i].tags || [], tag)) ids.push(albumList[i].id)
+    return ids
+  }
+
+  // ---- album checklist rows: every album, title-sorted (albumList already
+  //      sorts by title), checkbox reflecting desired membership.
+  function mixAlbumRows() {
+    var sel = mixSelected
+    return albumList.map(function(al) {
+      return { raw: al.id, albumId: al.id, cover: coverFor(al),
+               title: al.title, artist: al.artist || "", sub: al.artist || "",
+               checked: sel[al.id] === true, section: "" }
+    })
+  }
+
+  function selectedCount() {
+    var n = 0
+    for (var k in mixSelected) if (mixSelected[k]) n++
+    return n
+  }
+
+  // Albums matching the checklist's current filter (the "visible" set that
+  // a/A act on). Mirrors List's filterFn so a select-all never touches rows
+  // scrolled/filtered out of sight.
+  function visibleAlbumIds() {
+    var f = (mixAlbumList.filterText || "").toLowerCase()
+    var out = []
+    for (var i = 0; i < albumList.length; i++) {
+      var al = albumList[i]
+      if (f === "" || Util.filterByTitleOrArtist({ title: al.title, sub: al.artist || "" }, f))
+        out.push(al.id)
     }
-    return rows
+    return out
+  }
+
+  function setAlbumSelected(albumId, on) {
+    var m = ({})
+    for (var k in mixSelected) if (mixSelected[k]) m[k] = true
+    if (on) m[albumId] = true
+    else delete m[albumId]
+    mixSelected = m
+  }
+
+  // Space: toggle the focused album and advance the cursor one row, so
+  // holding Space walks down a range.
+  function toggleFocusedAlbum() {
+    var it = mixAlbumList.cursorItem
+    if (!it || !it.albumId) return
+    setAlbumSelected(it.albumId, mixSelected[it.albumId] !== true)
+    mixAlbumList.moveCursor(1)
+  }
+
+  function selectAllVisible(on) {
+    var ids = visibleAlbumIds()
+    var m = ({})
+    for (var k in mixSelected) if (mixSelected[k]) m[k] = true
+    for (var i = 0; i < ids.length; i++) {
+      if (on) m[ids[i]] = true
+      else delete m[ids[i]]
+    }
+    mixSelected = m
+  }
+
+  // ---- name step: Enter validates and advances (empty / duplicate names
+  //      are simply rejected — the step stays put; no inline error bar).
+  function advanceFromName() {
+    var nm = (mixName || "").trim()
+    if (nm === "") return
+    if (mixNameExists(nm)) return
+    mixName = nm
+    mixSelected = ({})
+    mixStep = "albums"
+    Qt.callLater(function() { mixAlbumList.resetCursor() })
+  }
+
+  function handleMixModalKey(event) {
+    if (mixStep === "name") {
+      var nameEdit = event.key === Qt.Key_Backspace
+                  || (event.text && event.text.length === 1 && event.text >= " ")
+      if (event.isAutoRepeat && !(root.listNavRepeats(event) || root.textEditRepeats(event, true)
+                                  && !(event.key === Qt.Key_Return || event.key === Qt.Key_Enter))) {
+        // Backspace/printable repeat while typing; everything else one-shot.
+        if (!nameEdit) { event.accepted = true; return }
+      }
+      if (event.key === Qt.Key_Escape) { closeMixModal(); event.accepted = true; return }
+      if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { advanceFromName(); event.accepted = true; return }
+      if (event.key === Qt.Key_Backspace) { mixName = mixName.slice(0, -1); event.accepted = true; return }
+      if (event.text && event.text.length === 1 && event.text >= " ") {
+        mixName += event.text; event.accepted = true; return
+      }
+      event.accepted = true
+      return
+    }
+
+    // ---- album step
+    // Repeat only cursor nav here; Space/a/A/Enter are one-shot.
+    if (event.isAutoRepeat && !root.listNavRepeats(event)) { event.accepted = true; return }
+
+    // While a filter is being typed, only Esc is special (List's cancel).
+    if (mixAlbumList.filtering) {
+      mixAlbumList.handleKey(event)
+      event.accepted = true
+      return
+    }
+    var t = event.text
+    if (event.key === Qt.Key_Escape) {
+      // Back a step: create -> name step, edit -> close (name is locked).
+      if (mixMode === "create") { mixStep = "name"; }
+      else closeMixModal()
+      event.accepted = true
+      return
+    }
+    if (event.key === Qt.Key_Space) { toggleFocusedAlbum(); event.accepted = true; return }
+    if (t === "a") { selectAllVisible(true); event.accepted = true; return }
+    if (t === "A") { selectAllVisible(false); event.accepted = true; return }
+    // Enter (submit via onActivated), j/k/arrows, g/G, / all belong to List.
+    mixAlbumList.handleKey(event)
+    event.accepted = true
+  }
+
+  // ---- submit: delta-only writes against the mix's live membership.
+  function submitMix() {
+    var adds = [], removes = []
+    if (mixMode === "create") {
+      for (var k in mixSelected) if (mixSelected[k]) adds.push(k)
+    } else {
+      var cur = currentMixMembership(mixName)
+      var sel = mixSelected
+      for (var a in sel) if (sel[a] && !cur[a]) adds.push(a)
+      for (var c in cur) if (cur[c] && !sel[c]) removes.push(c)
+    }
+    if (mixMode === "create" && adds.length === 0) {
+      return
+    }
+    var name = mixName
+    mixBatchTotal = 0; mixBatchDone = 0; mixBatchFailed = 0; mixBatchReqs = ({})
+    sendTagBatch(adds, name, true)
+    sendTagBatch(removes, name, false)
+    closeMixModal()
+    // Land the cursor on the freshly created mix row (already present in the
+    // optimistic mixList), so the "n failed" flash has somewhere to show.
+    if (mixMode === "create") Qt.callLater(function() { mainList.focusRaw("mix:" + name) })
+  }
+
+  // ---- concurrent tag writes with a completion tally.
+  function sendTagBatch(ids, tag, present) {
+    for (var i = 0; i < ids.length; i++) sendTagWrite(ids[i], tag, present)
+  }
+
+  function sendTagWrite(albumId, tag, present) {
+    var album = albumById(albumId)
+    if (!album) return
+    if (!connected) {
+      mixBatchTotal++; mixBatchDone++; mixBatchFailed++
+      checkMixBatch(tag)
+      return
+    }
+    var prev = (album.tags || []).slice()
+    var next = prev.slice()
+    var pos = -1
+    for (var i = 0; i < next.length; i++) if ((next[i] || "").toLowerCase() === tag.toLowerCase()) pos = i
+    if (present && pos < 0) next.push(tag)
+    if (!present && pos >= 0) next.splice(pos, 1)
+    var id = reqSeq++
+    var superseded = pendingTagReqsByAlbum[albumId]
+    if (superseded !== undefined) delete pendingTagReqs[superseded]
+    pendingTagReqs[id] = { albumId: albumId, tag: tag, prevTags: prev }
+    pendingTagReqsByAlbum[albumId] = id
+    applyAlbumTags(albumId, next)
+    mixBatchTotal++; mixBatchReqs[id] = true
+    console.info("jelly: mix toggle_tag req", id, "album", albumId, "tag", tag, "present", present)
+    send({ type: "toggle_tag", album_id: albumId, tag: tag, present: present, req_id: id })
+  }
+
+  function tickMixBatch(reqId, failed) {
+    if (mixBatchReqs[reqId] !== true) return
+    delete mixBatchReqs[reqId]
+    mixBatchDone++
+    if (failed) mixBatchFailed++
+    checkMixBatch(mixName)
+  }
+
+  function checkMixBatch(name) {
+    if (mixBatchTotal === 0 || mixBatchDone < mixBatchTotal) return
+    if (mixBatchFailed > 0) root.flashRow("mix:" + name, mixBatchFailed + " failed")
+    mixBatchTotal = 0; mixBatchDone = 0; mixBatchFailed = 0; mixBatchReqs = ({})
+  }
+
+  // ---- delete a mix: strip the tag from every member album (same path).
+  function openMixDelete(tag) {
+    deleteMixName = tag
+    deleteConfirmOpen = true
+    Qt.callLater(function() { deleteConfirmModal.forceActiveFocus() })
+  }
+
+  function closeDeleteConfirm() {
+    deleteConfirmOpen = false
+    Qt.callLater(function() { keyFocus.forceActiveFocus() })
+  }
+
+  function handleDeleteConfirmKey(event) {
+    if (event.key === Qt.Key_Escape) { closeDeleteConfirm(); event.accepted = true; return }
+    if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+      var tag = deleteMixName
+      var ids = memberAlbumIds(tag)
+      mixBatchTotal = 0; mixBatchDone = 0; mixBatchFailed = 0; mixBatchReqs = ({})
+      sendTagBatch(ids, tag, false)
+      closeDeleteConfirm()
+      event.accepted = true
+      return
+    }
+    event.accepted = true
   }
 
   function hasMixTag(tags, tag) {
@@ -843,97 +1085,6 @@ Panel {
 
   function albumCountText(count) {
     return count + " album" + (count === 1 ? "" : "s")
-  }
-
-  function canonicalMixLabel(label) {
-    var wanted = (label || "").trim()
-    if (wanted === "") return ""
-    var all = ((mixModalAlbum && mixModalAlbum.tags) || []).concat(mixList)
-    for (var i = 0; i < all.length; i++) {
-      if ((all[i] || "").toLowerCase() === wanted.toLowerCase()) return all[i]
-    }
-    return wanted
-  }
-
-  function setMixTag(tag, present) {
-    if (!connected) { mixModalError = "offline — mixes need a daemon connection"; return }
-    tag = canonicalMixLabel(tag)
-    if (!mixModalAlbum || !tag) return
-    var prev = (mixModalAlbum.tags || []).slice()
-    var next = prev.slice()
-    var pos = -1
-    for (var i = 0; i < next.length; i++) if (next[i].toLowerCase() === tag.toLowerCase()) pos = i
-    if (present && pos < 0) next.push(tag)
-    if (!present && pos >= 0) next.splice(pos, 1)
-    var id = reqSeq++
-    var superseded = pendingTagReqsByAlbum[mixModalAlbum.id]
-    if (superseded !== undefined) delete pendingTagReqs[superseded]
-    pendingTagReqs[id] = { albumId: mixModalAlbum.id, tag: tag, prevTags: prev }
-    pendingTagReqsByAlbum[mixModalAlbum.id] = id
-    applyAlbumTags(mixModalAlbum.id, next)
-    console.info("jelly: toggle_tag req", id, "album", mixModalAlbum.id, "tag", tag, "present", present,
-                 "superseded", superseded)
-    mixModalBusyTag = (present ? "adding " : "removing ") + tag
-    mixModalError = ""
-    send({ type: "toggle_tag", album_id: mixModalAlbum.id, tag: tag, present: present, req_id: id })
-    mixModalBusyTag = ""
-  }
-
-  function addMixTag(tag) {
-    setMixTag(tag, true)
-  }
-
-  function removeMixTag(tag) {
-    setMixTag(tag, false)
-  }
-
-  function toggleMixTag(tag) {
-    if (!mixModalAlbum || !tag) return
-    setMixTag(tag, !hasMixTag(mixModalAlbum.tags || [], tag))
-  }
-
-  function handleMixModalKey(event) {
-    // Repeat is opt-in here too: only cursor nav and, while typing a new
-    // mix, Backspace/printable editing repeat. Esc/m/Enter and list actions
-    // are one-shot (see listNavRepeats/textEditRepeats).
-    var repeatable = root.listNavRepeats(event)
-                     || root.textEditRepeats(event, mixModalInputMode)
-    if (event.isAutoRepeat && !repeatable) { event.accepted = true; return }
-    // Mirror the List filter's two-tier Esc: while typing a new mix, Esc
-    // clears the box and drops out of input mode (modal stays); from the
-    // browse state, Esc closes the modal.
-    if (event.key === Qt.Key_Escape) {
-      if (mixModalInputMode) {
-        mixModalNewName = ""
-        mixModalInputMode = false
-      } else {
-        closeMixModal()
-      }
-      event.accepted = true
-      return
-    }
-    if (event.text === "m" && !mixModalInputMode) { closeMixModal(); event.accepted = true; return }
-    if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-      if (mixModalInputMode) {
-        addMixTag(mixModalNewName.trim())
-        mixModalNewName = ""
-        mixModalInputMode = false
-      } else if (mixTagList.cursorItem && mixTagList.cursorItem.isNewMix) {
-        mixModalInputMode = true
-      } else if (mixTagList.cursorItem && mixTagList.cursorItem.tag) {
-        toggleMixTag(mixTagList.cursorItem.tag)
-      }
-      event.accepted = true
-      return
-    }
-    if (mixModalInputMode && event.key === Qt.Key_Backspace) {
-      mixModalNewName = mixModalNewName.slice(0, -1); event.accepted = true; return
-    }
-    if (mixModalInputMode && event.text && event.text.length === 1 && event.text >= " ") {
-      mixModalNewName += event.text; event.accepted = true; return
-    }
-    mixTagList.handleKey(event)
-    event.accepted = true
   }
 
   function closePalette() {
@@ -1080,7 +1231,7 @@ Panel {
     // Handles every panel-level key. List offers it the keys it did not
     // consume, so global bindings keep working on every tab.
     function handleGlobalKey(event) {
-        if (root.paletteOpen || root.mixModalOpen) { event.accepted = true; return }
+        if (root.paletteOpen || root.mixModalOpen || root.deleteConfirmOpen) { event.accepted = true; return }
         // Repeat is opt-in (see listNavRepeats/textEditRepeats): only cursor
         // nav, seek and filter typing survive auto-repeat; every discrete
         // action (transport, tier, queue, tab, play/pause, close) is one-shot.
@@ -1430,7 +1581,7 @@ Panel {
         emptyText: root.tab === "queue"
           ? "Queue empty — q queues the selected song, p plays it next"
            : (root.tab === "mixes" && root.mixList.length === 0
-              ? "No mixes yet — press m on an album"
+               ? "No mixes yet — Enter on “New Mix” to create one"
               : (root.tab === "albums" && albumList.length === 0
               ? "Loading library…"
               : (root.tab === "albums" && root.openAlbumId !== "" && !tracksLoaded[root.openAlbumId]
@@ -1461,68 +1612,164 @@ Panel {
         onActivated: item => root.activateRow(item)
       }
 
-      // Album mix editor. Existing tags are rows; typing creates a new
-      // mix name and Enter toggles it on the album.
-      Modal {
-        id: mixModal
-        open: root.mixModalOpen
-        modalHeight: Style.space(360)
-        closeOnEscape: false
-        Keys.onPressed: function(event) { root.handleMixModalKey(event) }
-        onCloseRequested: root.closeMixModal()
+      // Panel-wide modal layer. It is authored inside the list item but
+      // reparented to the card — `fullColumn.parent` is the contentHolder and
+      // its parent is the BorderSurface card that IS the widget (contentHolder
+      // is inset by the popup padding, so filling it stops short of the card
+      // edge). Anchoring to the card makes the scrim dim and the cards center
+      // on the ENTIRE widget, padding ring included. (Anchoring to `panel`
+      // fails: a KeyboardPanel is a full-screen PanelWindow, not an Item.)
+      Item {
+        id: modalOverlay
+        parent: fullColumn.parent.parent
+        anchors.fill: parent
+        z: 5
 
+        // Mix editor: one modal, two steps. Create opens on the name step (a
+        // plain field + blinking cursor); Enter validates and reveals the album
+        // checklist. Edit opens straight on the checklist with the mix's members
+        // pre-checked (name locked). The card hugs the active step and clamps to
+        // the widget; only the album list fills, so it scrolls when tall. Owns
+        // its key router (handleMixModalKey) to remap Space/Enter/a per step.
+        Modal {
+          id: mixModal
+          open: root.mixModalOpen
+          closeOnEscape: false
+          Keys.onPressed: function(event) { root.handleMixModalKey(event) }
+          onCloseRequested: root.closeMixModal()
+
+          // ---- step 1: name
+          Text {
+            visible: root.mixStep === "name"
+            Layout.fillWidth: true
+            leftPadding: Style.space(12)
+            textFormat: Text.PlainText
+            text: "New mix"
+            color: Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+
+          Item {
+            visible: root.mixStep === "name"
+            Layout.fillWidth: true
+            Layout.preferredHeight: nameField.implicitHeight
             Text {
-              width: parent.width
+              id: nameField
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(12)
+              anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
-              text: "Mixes for " + ((root.mixModalAlbum && root.mixModalAlbum.title) || "")
+              text: root.mixName
               color: Color.foreground
               font.family: Style.font.family
-              font.pixelSize: Style.font.body
-              font.bold: true
-              elide: Text.ElideRight
-            }
+              font.pixelSize: Math.round(Style.font.body * 1.15)
 
-            Text {
-              visible: root.mixModalError !== "" || root.mixModalBusyTag !== ""
-              width: parent.width
-              textFormat: Text.PlainText
-              text: root.mixModalError !== "" ? root.mixModalError : "writing " + root.mixModalBusyTag + "..."
-              color: root.mixModalError !== "" ? Color.accent : Qt.darker(Color.foreground, 1.4)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              elide: Text.ElideRight
-            }
-
-            List {
-              id: mixTagList
-              width: parent.width
-              height: Style.space(284)
-              debugName: "mix-modal"
-              rows: root.mixModalRows()
-              filterable: false
-              filterFn: Util.filterByKeyOrDesc
-              rowDelegate: mixRowComp
-              rowHeight: Style.space(42)
-              emptyText: "No existing mixes"
-              backHook: function() { root.closeMixModal(); return true }
-              onActivated: item => {
-                if (item.isNewMix) root.mixModalInputMode = true
-                else if (item.tag) root.toggleMixTag(item.tag)
+              Rectangle {
+                id: nameCursor
+                visible: root.mixStep === "name"
+                x: parent.contentWidth + Style.space(2)
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(8)
+                height: Math.round(Style.font.body * 1.15)
+                color: Color.accent
+                property bool on: true
+                opacity: on ? 1 : 0
+                Timer {
+                  interval: 500
+                  running: root.mixStep === "name"
+                  repeat: true
+                  onTriggered: nameCursor.on = !nameCursor.on
+                }
               }
             }
-      }
+          }
 
-      // command palette: dims the panel and floats a navigable list of
-      // every keybind. "/" switches to filter mode (input focused); Esc
-      // leaves filter mode; Esc/h in navigate mode closes.
-      Modal {
-        id: paletteModal
-        open: root.paletteOpen
-        modalHeight: Style.space(440)
-        // Everything the shared List doesn't consume is irrelevant to
-        // the palette; PgUp/PgDn page the cursor by 8 as before.
-        Keys.onPressed: function(event) { root.handlePaletteKey(event) }
-        onCloseRequested: root.closePalette()
+          // ---- step 2: album checklist
+          Text {
+            visible: root.mixStep === "albums"
+            Layout.fillWidth: true
+            leftPadding: Style.space(12)
+            textFormat: Text.PlainText
+            text: "Editing Mix: " + root.mixName
+            color: Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            font.bold: true
+            elide: Text.ElideRight
+          }
+
+          List {
+            id: mixAlbumList
+            visible: root.mixStep === "albums"
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            // Hug the rows (no layout-derived contentHeight -> no binding
+            // loop); when this exceeds the widget the card clamps and the
+            // list's Layout.fillHeight shrinks it to the room left, scrolling.
+            implicitHeight: mixAlbumList.rowCount * Style.space(48) + Style.space(34)
+            debugName: "mix-albums"
+            rows: root.mixAlbumRows()
+            filterable: true
+            filterFn: Util.filterByTitleOrArtist
+            rowDelegate: mixRowComp
+            rowHeight: Style.space(48)
+            emptyText: "No albums"
+            onActivated: item => root.submitMix()
+          }
+
+          Text {
+            visible: root.mixStep === "albums"
+            Layout.fillWidth: true
+            leftPadding: Style.space(12)
+            textFormat: Text.PlainText
+            text: root.selectedCount() + " selected"
+            color: Qt.darker(Color.foreground, 1.5)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        // Delete confirmation: Enter strips the tag from every member album
+        // (same delta write path), Esc dismisses. No affected-album list.
+        Modal {
+          id: deleteConfirmModal
+          open: root.deleteConfirmOpen
+          Keys.onPressed: function(event) { root.handleDeleteConfirmKey(event) }
+          onCloseRequested: root.closeDeleteConfirm()
+
+          Text {
+            Layout.fillWidth: true
+            textFormat: Text.PlainText
+            text: "Delete ‘" + root.deleteMixName + "’?"
+            color: Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            font.bold: true
+            elide: Text.ElideRight
+          }
+
+          Text {
+            Layout.fillWidth: true
+            textFormat: Text.PlainText
+            text: "Enter confirms · Esc cancels"
+            color: Qt.darker(Color.foreground, 1.5)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        // command palette: dims the whole widget and floats a navigable list
+        // of every keybind. "/" switches to filter mode (input focused); Esc
+        // leaves filter mode; Esc/h in navigate mode closes.
+        Modal {
+          id: paletteModal
+          open: root.paletteOpen
+          // Everything the shared List doesn't consume is irrelevant to the
+          // palette; PgUp/PgDn page the cursor by 8 as before.
+          Keys.onPressed: function(event) { root.handlePaletteKey(event) }
+          onCloseRequested: root.closePalette()
 
           // Same component as the main views: prompt, live filter (1 char
           // matches keybinds, longer text matches descriptions), cursor,
@@ -1530,8 +1777,9 @@ Panel {
           // Enter closes it (activation is display-only here).
           List {
             id: paletteList
-            width: parent.width
-            height: Style.space(416)
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            implicitHeight: paletteList.rowCount * Style.space(32) + Style.space(34)
             debugName: "palette"
             rows: root.paletteRows
             filterable: true
@@ -1542,6 +1790,7 @@ Panel {
             backHook: function() { root.closePalette(); return true }
             onActivated: item => root.closePalette()
           }
+        }
       }
 
       }

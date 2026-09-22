@@ -18,6 +18,7 @@ Item {
   readonly property var md: modelData || ({})
   readonly property var covers: md.covers || []
   readonly property real coverSize: Style.space(32)
+  readonly property bool bold: md.bold === true
 
   width: parent ? parent.width : 0
   implicitHeight: Style.space(56)
@@ -48,6 +49,7 @@ Item {
         color: Color.foreground
         font.family: Style.font.family
         font.pixelSize: Style.font.body
+        font.bold: mixRow.bold
         elide: Text.ElideRight
       }
 

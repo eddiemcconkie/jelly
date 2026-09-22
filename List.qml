@@ -55,6 +55,12 @@ Item {
   readonly property var cursorItem:
     (items.length > 0 && cursorPos < items.length) ? items[cursorPos] : null
 
+  // Full scroll height of the rows. Note: NOT ListView.contentHeight (that
+  // depends on cacheBuffer -> list.height -> whatever sizes the list, so a
+  // card reading it for its own height forms a binding loop). This is a pure
+  // data count; multiply by rowHeight to get a loop-free implicit height.
+  readonly property int rowCount: items.length
+
   // ---- filtering (navigate mode vs filter mode)
   // Filter UI: the prompt is always visible; `/` makes typed characters
   // append to it ("/ zelda"). Live results update as you type; Enter

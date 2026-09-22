@@ -1,6 +1,7 @@
-// Row for the album mix editor: checkbox + mix name on the left,
-// current album count on the right. The new-mix row becomes an inline
-// text prompt so the list geometry never shifts while typing.
+// Delegate for the mix editor's album checklist: cached cover + album
+// title + artist, with a 󰄱/󰄲 checkbox reflecting membership in this mix.
+// Toggling a row only changes the mix being edited — an album may belong to
+// many mixes — so membership lives in the modal, not on the album.
 import QtQuick
 import QtQuick.Layouts
 import qs.Commons
@@ -14,18 +15,11 @@ Item {
   property string tier: ""
   property string flashText: ""
 
-  width: parent ? parent.width : 0
-  implicitHeight: parent ? parent.height : Style.space(42)
-  height: implicitHeight
+  readonly property var md: modelData || ({})
 
-  Timer {
-    id: blinkTimer
-    interval: 500
-    repeat: true
-    running: mixRow.modelData && mixRow.modelData.inputMode === true
-    onTriggered: cursor.on = !cursor.on
-    onRunningChanged: cursor.on = running
-  }
+  width: parent ? parent.width : 0
+  implicitHeight: Style.space(48)
+  height: implicitHeight
 
   Rectangle {
     anchors.fill: parent
@@ -38,62 +32,57 @@ Item {
     anchors.verticalCenter: parent.verticalCenter
     anchors.leftMargin: Style.space(12)
     anchors.rightMargin: Style.space(12)
-    spacing: Style.space(8)
+    spacing: Style.space(10)
 
-    Text {
-      Layout.preferredWidth: Style.space(24)
-      textFormat: Text.PlainText
-      text: mixRow.modelData ? (mixRow.modelData.checkbox || "") : ""
-      color: Color.accent
-      font.family: Style.font.family
-      font.pixelSize: Math.round(Style.font.body * 1.15)
-      font.bold: true
-      horizontalAlignment: Text.AlignLeft
+    Image {
+      Layout.preferredWidth: Style.space(32)
+      Layout.preferredHeight: Style.space(32)
+      Layout.alignment: Qt.AlignVCenter
+      source: mixRow.md.cover || ""
+      asynchronous: true
+      cache: true
+      sourceSize.width: 128
+      sourceSize.height: 128
+      fillMode: Image.PreserveAspectCrop
     }
 
-    Item {
+    ColumnLayout {
       Layout.fillWidth: true
-      Layout.fillHeight: true
+      Layout.alignment: Qt.AlignVCenter
+      spacing: 0
 
       Text {
-        id: labelText
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
+        Layout.fillWidth: true
         textFormat: Text.PlainText
-        text: mixRow.modelData ? (mixRow.modelData.desc || "") : ""
+        text: mixRow.md.title || ""
         color: Color.foreground
         font.family: Style.font.family
-        font.pixelSize: Math.round(Style.font.body * 1.15)
-        font.bold: mixRow.modelData && mixRow.modelData.isNewMix === true
-        horizontalAlignment: Text.AlignLeft
+        font.pixelSize: Style.font.body
         elide: Text.ElideRight
       }
 
-      Rectangle {
-        id: cursor
-        visible: mixRow.modelData && mixRow.modelData.inputMode === true
-        anchors.left: labelText.left
-        anchors.leftMargin: labelText.contentWidth + Style.space(1)
-        anchors.verticalCenter: parent.verticalCenter
-        width: Style.space(7)
-        height: Style.space(18)
-        color: Color.accent
-        property bool on: true
-        opacity: on ? 1 : 0
+      Text {
+        Layout.fillWidth: true
+        visible: (mixRow.md.artist || "") !== ""
+        textFormat: Text.PlainText
+        text: mixRow.md.artist || ""
+        color: Qt.darker(Color.foreground, 1.5)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
       }
     }
 
     Text {
-      visible: mixRow.modelData ? (mixRow.modelData.albumCountText || "") !== "" : false
-      Layout.preferredWidth: Style.space(92)
+      Layout.preferredWidth: Style.space(24)
+      Layout.alignment: Qt.AlignVCenter
       textFormat: Text.PlainText
-      text: mixRow.modelData ? (mixRow.modelData.albumCountText || "") : ""
-      color: Qt.darker(Color.foreground, 1.5)
+      text: mixRow.md.checked ? "󰄲" : "󰄱"
+      color: mixRow.md.checked ? Color.accent : Qt.darker(Color.foreground, 1.6)
       font.family: Style.font.family
-      font.pixelSize: Style.font.caption
-      horizontalAlignment: Text.AlignRight
-      elide: Text.ElideRight
+      font.pixelSize: Math.round(Style.font.body * 1.15)
+      font.bold: true
+      horizontalAlignment: Text.AlignHCenter
     }
   }
 }
