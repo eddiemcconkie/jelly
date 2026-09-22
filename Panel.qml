@@ -119,7 +119,7 @@ Panel {
     delete pending[msg.req_id]
     if (req.kind === "browse_albums") {
       var acc = items.map(function(x) {
-        return { id: x.id, title: x.name, artist: x.detail || "", cover: x.image_url || "", tags: x.tags || [], tracks: [] }
+        return { id: x.id, title: x.name, artist: x.detail || "", cover: x.image_url || "", tags: x.tags || [], year: x.year || 0, tracks: [] }
       })
       // The server's SortName is franchise-edited on this server; sort by
       // plain album title here so the overview is alphabetical regardless.
@@ -134,7 +134,7 @@ Panel {
       for (var m = 0; m < next.length; m++) {
         if (next[m].id !== albumId) continue
         next[m] = {
-          id: next[m].id, title: next[m].title, artist: next[m].artist, cover: next[m].cover, tags: next[m].tags || [],
+          id: next[m].id, title: next[m].title, artist: next[m].artist, cover: next[m].cover, tags: next[m].tags || [], year: next[m].year || 0,
           tracks: items.map(function(x) {
             return { id: x.id, title: x.name, artist: x.detail || next[m].artist,
                      length: x.duration_secs || 0 }
@@ -429,12 +429,24 @@ Panel {
     return names
   }
 
+  // Albums carrying a mix tag, ordered by release year desc (matches the
+  // daemon's mix-track ordering) so a row's cover strip previews the mix's
+  // newest members.
+  function mixAlbums(tag) {
+    var out = []
+    for (var i = 0; i < albumList.length; i++) {
+      if (hasMixTag(albumList[i].tags || [], tag)) out.push(albumList[i])
+    }
+    out.sort(function(a, b) { return (b.year || 0) - (a.year || 0) })
+    return out
+  }
+
   function applyAlbumTags(albumId, tags) {
     var next = albumList.slice()
     for (var i = 0; i < next.length; i++) {
       if (next[i].id !== albumId) continue
       next[i] = { id: next[i].id, title: next[i].title, artist: next[i].artist,
-                  cover: next[i].cover, tags: uniqueNames(tags), tracks: next[i].tracks || [] }
+                  cover: next[i].cover, year: next[i].year || 0, tags: uniqueNames(tags), tracks: next[i].tracks || [] }
       break
     }
     albumList = next
@@ -520,7 +532,14 @@ Panel {
     }
     if (tab === "mixes") {
       return mixList.map(function(tag) {
-        return { raw: "mix:" + tag, isMix: true, title: tag, artist: "Mix", sub: "Tagged albums",
+        var al = mixAlbums(tag)
+        var covers = []
+        for (var i = 0; i < al.length && covers.length < 10; i++) {
+          var c = coverFor(al[i])  // prefer the disk-cached file:// url
+          if (c) covers.push(c)
+        }
+        return { raw: "mix:" + tag, isMix: true, title: tag, artist: "", sub: albumCountText(al.length),
+                 covers: covers, coverCount: al.length,
                  cover: "", showCover: false, showGlyph: false, section: "" }
       })
     }
@@ -1346,6 +1365,7 @@ Panel {
 
       Component { id: trackRowComp; TrackRow {} }
       Component { id: commandRowComp; CommandRow {} }
+      Component { id: mixListRowComp; MixListRow {} }
       Component { id: mixRowComp; MixRow {} }
 
       // Queue header: a fixed "Up next" strip above the list, only while
@@ -1387,11 +1407,12 @@ Panel {
         // Delegate + its height travel together: commands get the compact
         // keybind row; track lists get the media row (cover rows 56 tall,
         // drill rows 40).
-        rowDelegate: root.tab === "commands"
-          ? commandRowComp : trackRowComp
+        rowDelegate: root.tab === "commands" ? commandRowComp
+          : (root.tab === "mixes" ? mixListRowComp : trackRowComp)
         rowHeight: root.tab === "commands"
           ? Style.space(32)
-          : (root.openAlbumId !== "" ? Style.space(40) : Style.space(56))
+          : (root.tab === "mixes" ? Style.space(56)
+          : (root.openAlbumId !== "" ? Style.space(40) : Style.space(56)))
         // Queue strips ("Up next", context name) are half-height.
         secHeight: root.tab === "queue" ? Style.space(28) : Style.space(56)
         reversed: false

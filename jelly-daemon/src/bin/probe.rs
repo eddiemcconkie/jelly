@@ -13,6 +13,119 @@ async fn main() -> anyhow::Result<()> {
     let mut c = JellyfinClient::new("https://jellyfin.mcconkie.dev");
     c.authenticate(&user, &pw).await?;
     let uid = c.user_id().unwrap().to_string();
+
+    // `cargo run --bin probe -- mixtime` times the mix-track query with the
+    // current field set vs a lean one, to isolate the play-mix latency.
+    if std::env::args().any(|a| a == "mixtime") {
+        use jelly_daemon::jellyfin::mix_labels;
+        use std::collections::HashMap;
+        use std::time::Instant;
+        let allal = c.all_albums().await?;
+        let mut map: HashMap<String, usize> = HashMap::new();
+        for a in allal.iter() {
+            for t in mix_labels(&a.tags.clone().unwrap_or_default()) {
+                *map.entry(t).or_insert(0) += 1;
+            }
+        }
+        let mut tags: Vec<(String, usize)> = map.into_iter().collect();
+        tags.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("mix tags by album count: {tags:?}");
+        for (tag, _) in tags.iter().take(3) {
+            let stored = format!("mix:{tag}");
+            let t0 = Instant::now();
+            let full: jelly_daemon::jellyfin::ItemsResponse = c
+                .get_json(
+                    "/Items",
+                    &[
+                        ("userId", uid.as_str()),
+                        ("includeItemTypes", "Audio"),
+                        ("recursive", "true"),
+                        ("tags", stored.as_str()),
+                        (
+                            "fields",
+                            "ImageTags,MediaSources,Artists,ProductionYear,ParentIndexNumber,IndexNumber",
+                        ),
+                        ("limit", "100000"),
+                    ],
+                )
+                .await?;
+            println!(
+                "[full] {tag}: {} items in {:?}",
+                full.items.len(),
+                t0.elapsed()
+            );
+            let t1 = Instant::now();
+            let lean: jelly_daemon::jellyfin::ItemsResponse = c
+                .get_json(
+                    "/Items",
+                    &[
+                        ("userId", uid.as_str()),
+                        ("includeItemTypes", "Audio"),
+                        ("recursive", "true"),
+                        ("tags", stored.as_str()),
+                        ("fields", "ImageTags,Artists"),
+                    ],
+                )
+                .await?;
+            println!(
+                "[lean] {tag}: {} items in {:?}",
+                lean.items.len(),
+                t1.elapsed()
+            );
+            if let Some(x) = lean.items.first() {
+                println!(
+                    "  lean sample: {} year={:?} disc={:?} track={:?} dur={:?}",
+                    x.name,
+                    x.production_year,
+                    x.parent_index_number,
+                    x.index_number,
+                    x.run_time_ticks.map(|v| v as f64 / 1e7)
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // `cargo run --bin probe -- mixalbum` times resolving a mix via parallel
+    // per-album parentId lookups (the proposed optimization).
+    if std::env::args().any(|a| a == "mixalbum") {
+        use futures::stream::{self, StreamExt};
+        use jelly_daemon::jellyfin::mix_labels;
+        use std::collections::HashMap;
+        use std::time::Instant;
+        let allal = c.all_albums().await?;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for a in allal.iter() {
+            for t in mix_labels(&a.tags.clone().unwrap_or_default()) {
+                map.entry(t).or_default().push(a.id.clone());
+            }
+        }
+        let mut tags: Vec<(String, Vec<String>)> = map.into_iter().collect();
+        tags.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        for (tag, album_ids) in tags.iter().take(3) {
+            let ids = album_ids.clone();
+            let n = ids.len();
+            let t0 = Instant::now();
+            let all = stream::iter(ids)
+                .map(|id| {
+                    let cc = c.clone();
+                    async move { cc.tracks_for_album(&id).await.unwrap_or_default() }
+                })
+                .buffer_unordered(16)
+                .fold(Vec::new(), |mut acc, mut chunk| async move {
+                    acc.append(&mut chunk);
+                    acc
+                })
+                .await;
+            println!(
+                "[album-parallel] {tag}: {n} albums -> {} tracks in {:?}",
+                all.len(),
+                t0.elapsed()
+            );
+        }
+        return Ok(());
+    }
+
     let albums: jelly_daemon::jellyfin::ItemsResponse = c
         .get_json(
             "/Items",

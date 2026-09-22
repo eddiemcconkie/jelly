@@ -337,6 +337,10 @@ pub struct BrowseItem {
     pub image_url: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Release year (albums); lets the UI order a mix's member-album covers
+    /// by year desc without a second round-trip. Absent for tracks.
+    #[serde(default)]
+    pub year: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -567,6 +571,7 @@ mod tests {
                     duration_secs: None,
                     image_url: None,
                     tags: vec![],
+                    year: None,
                 }],
                 library_rev: 7,
             },

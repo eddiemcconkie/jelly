@@ -98,6 +98,29 @@ pub fn mix_labels(tags: &[String]) -> Vec<String> {
     labels.into_values().collect()
 }
 
+/// Order a mix's tracks the way the playback context and generated
+/// playlists must: album release year descending, then disc, then track,
+/// then name as a stable tiebreaker. Contexts stay unfiltered by score;
+/// the tier walk (JELLY-40) decides what actually plays.
+pub fn sort_mix_tracks(items: &mut Vec<MediaItem>) {
+    items.sort_by(|a, b| {
+        b.production_year
+            .unwrap_or_default()
+            .cmp(&a.production_year.unwrap_or_default())
+            .then(
+                a.parent_index_number
+                    .unwrap_or_default()
+                    .cmp(&b.parent_index_number.unwrap_or_default()),
+            )
+            .then(
+                a.index_number
+                    .unwrap_or_default()
+                    .cmp(&b.index_number.unwrap_or_default()),
+            )
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
 #[derive(Debug, Clone)]
 pub struct JellyfinClient {
     base_url: String,
@@ -127,7 +150,7 @@ struct AuthUser {
     id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct MediaItem {
     pub id: String,
@@ -484,7 +507,7 @@ impl JellyfinClient {
                     ("includeItemTypes", "MusicAlbum"),
                     ("recursive", "true"),
                     ("sortBy", "SortName"),
-                    ("fields", "ImageTags,ChildCount,Tags"),
+                    ("fields", "ImageTags,ChildCount,Tags,ProductionYear"),
                 ],
             )
             .await?;
@@ -581,6 +604,13 @@ impl JellyfinClient {
 
     /// Full track list for a mix tag. Sorting is album release year desc,
     /// then disc, then track; contexts remain unfiltered by score.
+    ///
+    /// The `tags=…&recursive=true` scan is the slow part (Jellyfin does not
+    /// index tags), so request only the fields we consume. `MediaSources`
+    /// (per-item probe data) and `ProductionYear/ParentIndexNumber/
+    /// IndexNumber` are omitted: the latter three come back as default DTO
+    /// fields, and dropping MediaSources halves worst-case latency
+    /// (measured ~10.8s -> ~5.6s for a 2800-track mix).
     pub async fn tracks_for_tag(&self, tag: &str) -> Result<Vec<MediaItem>> {
         let user_id = self.user_id.as_deref().context("not authenticated")?;
         let stored_tag = mix_tag(tag);
@@ -592,28 +622,12 @@ impl JellyfinClient {
                     ("includeItemTypes", "Audio"),
                     ("recursive", "true"),
                     ("tags", &stored_tag),
-                    ("fields", "ImageTags,MediaSources,Artists,ProductionYear,ParentIndexNumber,IndexNumber"),
-                    ("limit", "100000"),
+                    ("fields", "ImageTags,Artists"),
                 ],
             )
             .await?;
         let mut items = resp.items;
-        items.sort_by(|a, b| {
-            b.production_year
-                .unwrap_or_default()
-                .cmp(&a.production_year.unwrap_or_default())
-                .then(
-                    a.parent_index_number
-                        .unwrap_or_default()
-                        .cmp(&b.parent_index_number.unwrap_or_default()),
-                )
-                .then(
-                    a.index_number
-                        .unwrap_or_default()
-                        .cmp(&b.index_number.unwrap_or_default()),
-                )
-                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
+        sort_mix_tracks(&mut items);
         Ok(items)
     }
 
@@ -666,6 +680,7 @@ pub fn browse_item_from(item: &MediaItem, image_url: Option<String>) -> BrowseIt
         duration_secs: item.run_time_ticks.map(|t| t as f64 / 10_000_000.0),
         image_url,
         tags: mix_labels(&item.tags.clone().unwrap_or_default()),
+        year: item.production_year,
     }
 }
 
@@ -703,6 +718,30 @@ mod tests {
             "mix:Driving".into(),
         ]);
         assert_eq!(labels, vec!["Driving".to_string(), "Nintendo".to_string()]);
+    }
+
+    #[test]
+    fn sort_mix_tracks_orders_year_desc_then_disc_then_track() {
+        let track = |name: &str, year: i32, disc: i32, idx: i32| MediaItem {
+            id: name.into(),
+            name: name.into(),
+            production_year: Some(year),
+            parent_index_number: Some(disc),
+            index_number: Some(idx),
+            ..Default::default()
+        };
+        let mut items = vec![
+            track("older-lead", 2019, 1, 1),
+            track("newer-d2t3", 2024, 2, 3),
+            track("newer-d1t2", 2024, 1, 2),
+            track("newer-d1t1", 2024, 1, 1),
+        ];
+        sort_mix_tracks(&mut items);
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["newer-d1t1", "newer-d1t2", "newer-d2t3", "older-lead"]
+        );
     }
 
     #[test]
